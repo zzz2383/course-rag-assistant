@@ -16,7 +16,8 @@ toolbarMode = "minimal"
 
 [server]
 headless = true
-maxUploadSize = 50
+# 与后端 MAX_FILE_SIZE_MB(20) 保持一致，避免前端放行大文件后被后端拒绝
+maxUploadSize = 20
 
 [browser]
 gatherUsageStats = false

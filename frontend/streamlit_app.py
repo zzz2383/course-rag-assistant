@@ -1833,6 +1833,47 @@ def main() -> None:
         [data-testid="stToolbar"] { display: none !important; }
         [data-testid="stDecoration"] { display: none !important; }
         [data-testid="stStatusWidget"] { display: none !important; }
+
+        /* ---- 文件上传区中文化 ----
+           Streamlit 的上传控件文案写死在前端 JS 里（Drag and drop ... / Browse files /
+           200MB per file 等），无法用参数配置，这里用 CSS 隐藏英文原文，
+           再用伪元素叠加对应中文，保持界面全中文。 */
+        [data-testid="stFileUploaderDropzone"] {
+            position: relative;
+        }
+        /* 隐藏原文案：Drop/浏览文字所在的 span 与按钮文字 */
+        [data-testid="stFileUploaderDropzone"] > div > span,
+        [data-testid="stFileUploaderDropzone"] small,
+        [data-testid="stFileUploaderDropzoneInstructions"] > div > span,
+        [data-testid="stFileUploaderDropzoneInstructions"] small,
+        [data-testid="stFileUploaderDropzone"] button {
+            font-size: 0 !important;
+            color: transparent !important;
+        }
+        /* 叠加中文提示：拖拽上传 */
+        [data-testid="stFileUploaderDropzoneInstructions"]::after {
+            content: "将文件拖拽到此处上传";
+            display: block;
+            font-size: 0.95rem;
+            color: #31333F;
+            margin-top: 2px;
+        }
+        /* 叠加中文提示：文件大小限制 */
+        [data-testid="stFileUploaderDropzoneInstructions"]::before {
+            content: "支持 PDF / PPTX / DOCX / TXT，单个文件不超过 20MB";
+            display: block;
+            font-size: 0.8rem;
+            color: #808495;
+            margin-top: 4px;
+        }
+        /* 叠加中文提示：选择文件按钮 */
+        [data-testid="stFileUploaderDropzone"] button::after {
+            content: "选择文件";
+            font-size: 0.875rem;
+            color: #31333F;
+        }
+        /* 已选文件列表中的删除按钮提示保持可点击区域 */
+        [data-testid="stFileUploaderFileName"] { word-break: break-all; }
         </style>
         """,
         unsafe_allow_html=True,
