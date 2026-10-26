@@ -27,6 +27,12 @@ MAX_UPLOAD_MB = 20
 
 SUPPORTED_FILE_TYPES = ["pdf", "pptx", "docx", "txt"]
 
+# 练习自测页签使用的名称映射，取值与后端 ExerciseRequest 保持一致。
+EXERCISE_TYPE_LABELS = {"blank": "填空题", "choice": "选择题"}
+EXERCISE_TYPE_ORDER = ("blank", "choice")
+EXERCISE_DIFFICULTY_LABELS = {"easy": "简单", "medium": "中等", "hard": "困难"}
+EXERCISE_CHOICE_PLACEHOLDER = "（请选择）"
+
 STATUS_LABELS = {
     "uploaded": "处理中",
     "parsed": "待索引",
@@ -324,6 +330,42 @@ def generate_plan(
     return _unwrap_data(payload)
 
 
+def generate_exercises(
+    course: str,
+    chapter: str,
+    count: int,
+    types: list[str],
+    difficulty: str,
+    use_llm: bool,
+) -> dict[str, Any]:
+    """POST /api/exercises：根据课程资料生成练习题。
+
+    ``types`` 只接受 ``blank``（填空）与 ``choice``（选择）；``difficulty``
+    取 ``easy`` / ``medium`` / ``hard``。没有资料时后端仍返回 200，
+    只是 ``items`` 为空、具体原因写在 ``warnings`` 中。
+    """
+    request_body: dict[str, Any] = {
+        "course": course.strip(),
+        "count": int(count),
+        "types": list(types),
+        "difficulty": difficulty,
+        "use_llm": bool(use_llm),
+    }
+    if chapter.strip():
+        request_body["chapter"] = chapter.strip()
+
+    payload = _request("POST", "/exercises", json_body=request_body, timeout=(10, 180))
+    data = _unwrap_data(payload)
+    if not isinstance(data, dict):
+        raise BackendError("后端返回的练习题结果格式不正确，未找到题目数据。")
+
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    if not isinstance(data.get("warnings"), list):
+        data["warnings"] = []
+    return data
+
+
 # ---------------------------------------------------------------------------
 # 通用页面组件
 # ---------------------------------------------------------------------------
@@ -419,7 +461,8 @@ def _render_sidebar() -> None:
         st.markdown(
             "1. 上传课程资料并等待索引完成\n"
             "2. 在「课程问答」中提问并核对引用\n"
-            "3. 在「复习计划」中生成并导出计划"
+            "3. 在「复习计划」中生成并导出计划\n"
+            "4. 在「练习自测」中生成题目并提交判分"
         )
         st.divider()
         st.caption("前端只通过 REST API 访问后端，不读取任何模型密钥。")
@@ -1186,6 +1229,458 @@ def _render_plan_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 页签四：练习自测
+# ---------------------------------------------------------------------------
+def _exercise_items_of(payload: Any) -> list[dict[str, Any]]:
+    """从接口结果中取出题目列表，丢弃结构异常的条目。"""
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _exercise_type(item: dict[str, Any]) -> str:
+    """判断题目类型；后端字段缺失时按是否带选项推断。"""
+    value = str(item.get("type") or "").strip().lower()
+    if value in EXERCISE_TYPE_LABELS:
+        return value
+    options = item.get("options")
+    if isinstance(options, list) and len(options) >= 2:
+        return "choice"
+    return "blank"
+
+
+def _exercise_options(item: dict[str, Any]) -> list[str]:
+    """取出选择题的选项文本，过滤空项。"""
+    options = item.get("options")
+    if not isinstance(options, list):
+        return []
+    return [str(option).strip() for option in options if str(option).strip()]
+
+
+def _choice_option_labels(options: list[str]) -> list[str]:
+    """给选项加上 A/B/C/D 前缀，作为单选按钮的展示文本。"""
+    letters = "ABCDEFGHIJ"
+    return [
+        f"{letters[position] if position < len(letters) else position + 1}. {text}"
+        for position, text in enumerate(options)
+    ]
+
+
+def _exercise_answer_index(item: dict[str, Any], options: list[str]) -> int:
+    """取出选择题的正确选项下标；缺省或越界时返回 -1。"""
+    try:
+        index = int(item.get("answer_index"))
+    except (TypeError, ValueError):
+        return -1
+    return index if 0 <= index < len(options) else -1
+
+
+def _normalise_blank_answer(value: Any) -> str:
+    """填空题判分归一化：忽略大小写、全角空格与所有空白字符。"""
+    text = str(value or "").replace("\u3000", " ")
+    return re.sub(r"\s+", "", text).casefold()
+
+
+def _escape_markdown(text: str) -> str:
+    """转义题干/解析中的 Markdown 特殊字符，避免填空线被渲染成斜体。"""
+    return re.sub(r"([_*`\[\]\\])", r"\\\1", str(text or ""))
+
+
+def _exercise_source_text(item: dict[str, Any]) -> str:
+    """题目的来源说明：文件名 + 页码。"""
+    filename = (
+        _first_text(item, "source_file", "file_name", "filename", "source") or "未知来源"
+    )
+    page = item.get("page")
+    if page in (None, ""):
+        return f"来源：{filename} ｜ 页码未知"
+    page_number = _display_int(page, default=str(page))
+    page_text = "无页码" if page_number == 0 else f"第 {page_number} 页"
+    return f"来源：{filename} ｜ {page_text}"
+
+
+def _exercise_answer_key(generation_id: int, position: int) -> str:
+    """作答控件的 session_state 键名；重新生成题目后自动换新键。"""
+    return f"exercise_answer_{generation_id}_{position}"
+
+
+def _build_exercise_result(
+    items: list[dict[str, Any]],
+    answers: dict[int, Any],
+) -> dict[str, Any]:
+    """按作答内容判分，返回可直接展示的结果字典。
+
+    填空题做大小写与空白归一化比较；选择题先把单选文本还原成下标，
+    再与后端返回的 ``answer_index`` 比较。
+    """
+    details: list[dict[str, Any]] = []
+    score = 0
+    answered_count = 0
+
+    for position, item in enumerate(items):
+        kind = _exercise_type(item)
+        raw_answer = answers.get(position)
+        explanation = str(item.get("explanation") or "").strip()
+
+        if kind == "choice":
+            options = _exercise_options(item)
+            labels = _choice_option_labels(options)
+            chosen_label = str(raw_answer or "").strip()
+            chosen_index = labels.index(chosen_label) if chosen_label in labels else -1
+            answer_index = _exercise_answer_index(item, options)
+            answered = chosen_index >= 0
+            is_correct = answered and answer_index >= 0 and chosen_index == answer_index
+            user_answer = labels[chosen_index] if answered else ""
+            correct_answer = (
+                labels[answer_index]
+                if 0 <= answer_index < len(labels)
+                else "（后端未返回标准答案）"
+            )
+        else:
+            answer_text = str(item.get("answer") or "").strip()
+            user_answer = str(raw_answer or "").strip()
+            answered = bool(user_answer)
+            is_correct = (
+                answered
+                and bool(answer_text)
+                and _normalise_blank_answer(user_answer)
+                == _normalise_blank_answer(answer_text)
+            )
+            correct_answer = answer_text or "（后端未返回标准答案）"
+
+        if answered:
+            answered_count += 1
+        if is_correct:
+            score += 1
+
+        details.append(
+            {
+                "number": position + 1,
+                "type": kind,
+                "stem": str(item.get("stem") or "").strip(),
+                "user_answer": user_answer,
+                "correct_answer": correct_answer,
+                "answered": answered,
+                "is_correct": is_correct,
+                "explanation": explanation,
+            }
+        )
+
+    total = len(details)
+    return {
+        "score": score,
+        "total": total,
+        "answered": answered_count,
+        "accuracy": (score / total * 100.0) if total else 0.0,
+        "details": details,
+        "graded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _render_exercise_meta(meta: dict[str, Any]) -> None:
+    """展示本次出题的来源标记与参数摘要。"""
+    generated_by = str(meta.get("generated_by") or "")
+    normalized = generated_by.lower()
+    label = _generated_by_label(generated_by)
+    if any(keyword in normalized for keyword in ("rule", "fallback", "template")):
+        st.warning(
+            f"本题由{label}。大模型暂不可用或输出未通过校验，题目仍可正常作答；"
+            "模型恢复后可重新生成。"
+        )
+    elif normalized:
+        st.success(f"题目来源：{label}")
+    else:
+        st.caption("后端未返回 generated_by，无法确认题目来源。")
+
+    meta_parts: list[str] = []
+    if meta.get("course"):
+        meta_parts.append(f"课程：{meta['course']}")
+    if meta.get("chapter"):
+        meta_parts.append(f"章节：{meta['chapter']}")
+    types = meta.get("types") or []
+    if types:
+        meta_parts.append(
+            "题型：" + "、".join(EXERCISE_TYPE_LABELS.get(str(item), str(item)) for item in types)
+        )
+    difficulty = str(meta.get("difficulty") or "")
+    if difficulty:
+        meta_parts.append(f"难度：{EXERCISE_DIFFICULTY_LABELS.get(difficulty, difficulty)}")
+    if meta.get("generated_at"):
+        meta_parts.append(f"生成时间：{meta['generated_at']}")
+    if meta_parts:
+        st.caption(" ｜ ".join(meta_parts))
+
+    for warning in meta.get("warnings") or []:
+        st.caption(f"后端提示：{warning}")
+
+
+def _render_exercise_score(result: dict[str, Any]) -> None:
+    """顶部得分概览：得分、正确率与已作答数量。"""
+    total = int(result.get("total") or 0)
+    score = int(result.get("score") or 0)
+    accuracy = float(result.get("accuracy") or 0.0)
+    answered = int(result.get("answered") or 0)
+
+    col_score, col_accuracy, col_answered = st.columns(3)
+    with col_score:
+        st.metric("得分", f"{score}/{total}")
+    with col_accuracy:
+        st.metric("正确率", f"{accuracy:.0f}%")
+    with col_answered:
+        st.metric("已作答", f"{answered}/{total}")
+    st.caption(
+        f"判分时间：{result.get('graded_at') or '—'}；修改答案后请重新提交以更新得分。"
+    )
+
+
+def _render_exercise_feedback(detail: dict[str, Any]) -> None:
+    """展示单题判分：对错、标准答案与解析。"""
+    is_correct = bool(detail.get("is_correct"))
+    answered = bool(detail.get("answered"))
+    if is_correct:
+        st.success("✅ 回答正确")
+    elif not answered:
+        st.error("❌ 未作答")
+    else:
+        st.error(f"❌ 回答不正确 ｜ 你的答案：{detail.get('user_answer') or '（空）'}")
+
+    st.markdown(
+        f"**正确答案：** {_escape_markdown(str(detail.get('correct_answer') or '—'))}"
+    )
+    explanation = str(detail.get("explanation") or "").strip()
+    if explanation:
+        st.markdown(f"**解析：** {_escape_markdown(explanation)}")
+    else:
+        st.caption("本题为填空题，标准答案直接取自资料原文，可对照下方来源核对。")
+
+
+def _render_exercises_tab() -> None:
+    """页签四：练习自测，生成题目、作答、提交判分。"""
+    _show_flash()
+
+    st.subheader("练习自测")
+    st.caption(
+        "根据已索引的课程资料生成填空题与选择题；提交后自动判分，"
+        "并给出标准答案、解析与原文来源。"
+    )
+
+    with st.container(border=True):
+        col_course, col_chapter = st.columns(2)
+        course = col_course.text_input(
+            "课程名称 *",
+            placeholder="与上传资料时填写的课程名称保持一致",
+            key="exercise_course_input",
+        )
+        chapter = col_chapter.text_input(
+            "章节（可选）",
+            placeholder="留空表示从整门课程中抽题",
+            key="exercise_chapter_input",
+        )
+
+        col_count, col_difficulty, col_llm = st.columns([2, 1, 1])
+        count = col_count.slider(
+            "题目数量",
+            min_value=1,
+            max_value=10,
+            value=5,
+            step=1,
+            key="exercise_count_slider",
+            help="单次最多生成 10 道题目，题型会在所选范围内轮转分配。",
+        )
+        difficulty = col_difficulty.selectbox(
+            "难度",
+            options=list(EXERCISE_DIFFICULTY_LABELS),
+            format_func=lambda value: EXERCISE_DIFFICULTY_LABELS[value],
+            index=1,
+            key="exercise_difficulty_select",
+        )
+        use_llm = col_llm.checkbox(
+            "使用大模型出题",
+            value=True,
+            key="exercise_use_llm_checkbox",
+            help="关闭后直接使用规则模板出题，速度更快，但题目样式相对固定。",
+        )
+
+        selected_types = st.multiselect(
+            "题型 *",
+            options=list(EXERCISE_TYPE_ORDER),
+            default=list(EXERCISE_TYPE_ORDER),
+            format_func=lambda value: EXERCISE_TYPE_LABELS[value],
+            key="exercise_types_select",
+            placeholder="请选择至少一种题型",
+        )
+        generate_clicked = st.button(
+            "生成题目",
+            key="generate_exercises_btn",
+            type="primary",
+        )
+
+    if generate_clicked:
+        course_text = course.strip()
+        types = [value for value in EXERCISE_TYPE_ORDER if value in selected_types]
+        if not course_text:
+            st.warning("请填写课程名称。")
+        elif not types:
+            st.warning("请至少选择一种题型（填空题或选择题）。")
+        else:
+            with st.spinner("正在检索资料并生成题目，请稍候..."):
+                try:
+                    raw = generate_exercises(
+                        course_text, chapter, count, types, difficulty, use_llm
+                    )
+                except Exception as exc:
+                    # 只提示本次失败，不清空已有题目，便于稍后重试。
+                    _show_backend_error(exc)
+                else:
+                    items = _exercise_items_of(raw)
+                    generation_id = (
+                        int(st.session_state.get("exercise_generation_id") or 0) + 1
+                    )
+                    st.session_state["exercise_generation_id"] = generation_id
+                    st.session_state["exercise_items"] = items
+                    st.session_state["exercise_meta"] = {
+                        "course": str(raw.get("course") or course_text),
+                        "chapter": str(raw.get("chapter") or "").strip(),
+                        "types": types,
+                        "difficulty": difficulty,
+                        "use_llm": bool(use_llm),
+                        "target_count": int(count),
+                        "generated_by": str(raw.get("generated_by") or ""),
+                        "warnings": [
+                            str(item).strip()
+                            for item in (raw.get("warnings") or [])
+                            if str(item).strip()
+                        ],
+                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "generation_id": generation_id,
+                    }
+                    # 新题目不继承上一批题目的作答与判分结果
+                    st.session_state.pop("exercise_result", None)
+                    for stale_key in list(st.session_state.keys()):
+                        if str(stale_key).startswith("exercise_answer_"):
+                            st.session_state.pop(stale_key, None)
+                    if items:
+                        _set_flash(f"已生成 {len(items)} 道题目，请作答后提交。")
+                    else:
+                        _set_flash(
+                            "当前课程暂无资料，请先在资料管理页上传并建立索引后再生成题目。",
+                            kind="warning",
+                        )
+                    st.rerun()
+
+    st.divider()
+    items = st.session_state.get("exercise_items")
+    meta = st.session_state.get("exercise_meta")
+    if not isinstance(meta, dict):
+        st.info("生成后会在此处显示题目；作答后点击「提交答案」即可查看得分与逐题解析。")
+        return
+
+    _render_exercise_meta(meta)
+
+    if not isinstance(items, list) or not items:
+        st.warning("当前课程暂无资料，请先在资料管理页上传并建立索引后再生成题目。")
+        return
+
+    generation_id = int(meta.get("generation_id") or 0)
+    result = st.session_state.get("exercise_result")
+    if not isinstance(result, dict) or int(result.get("total") or 0) != len(items):
+        result = None
+        details: list[Any] = []
+    else:
+        details = result.get("details") if isinstance(result.get("details"), list) else []
+    if result is not None:
+        _render_exercise_score(result)
+
+    target = int(meta.get("target_count") or 0)
+    heading = f"#### 共 {len(items)} 道题目"
+    if target and target != len(items):
+        heading = f"{heading}（目标 {target} 道）"
+    st.markdown(heading)
+
+    for position, item in enumerate(items):
+        kind = _exercise_type(item)
+        stem = str(item.get("stem") or "").strip() or "（题干为空）"
+        with st.container(border=True):
+            st.markdown(
+                f"**{position + 1}. [{EXERCISE_TYPE_LABELS[kind]}]** "
+                f"{_escape_markdown(stem)}"
+            )
+            hint = str(item.get("hint") or "").strip()
+            if hint:
+                st.caption(f"提示：{hint}")
+
+            key = _exercise_answer_key(generation_id, position)
+            if kind == "choice":
+                labels = _choice_option_labels(_exercise_options(item))
+                if labels:
+                    # 首项为占位项，默认即“未作答”，不使用 index 预选答案
+                    st.radio(
+                        f"第 {position + 1} 题选项",
+                        options=[EXERCISE_CHOICE_PLACEHOLDER, *labels],
+                        key=key,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.warning("后端未返回该题的选项，暂时无法作答。")
+            else:
+                st.text_input(
+                    f"第 {position + 1} 题作答",
+                    key=key,
+                    placeholder="填写空缺的内容",
+                    label_visibility="collapsed",
+                )
+
+            detail = details[position] if position < len(details) else None
+            if isinstance(detail, dict):
+                st.divider()
+                _render_exercise_feedback(detail)
+            st.caption(_exercise_source_text(item))
+
+    col_submit, col_reset, col_tip = st.columns([1, 1, 2])
+    with col_submit:
+        submitted = st.button(
+            "提交答案",
+            key="submit_exercises_btn",
+            type="primary",
+            use_container_width=True,
+        )
+    with col_reset:
+        reset_clicked = st.button(
+            "重新作答",
+            key="reset_exercises_btn",
+            use_container_width=True,
+        )
+    with col_tip:
+        st.caption("填空判分忽略大小写与空白；选择题按所选选项文本比对。")
+
+    if reset_clicked:
+        prefix = f"exercise_answer_{generation_id}_"
+        for stale_key in list(st.session_state.keys()):
+            if str(stale_key).startswith(prefix):
+                st.session_state.pop(stale_key, None)
+        st.session_state.pop("exercise_result", None)
+        st.rerun()
+
+    if submitted:
+        answers = {
+            position: st.session_state.get(
+                _exercise_answer_key(generation_id, position), ""
+            )
+            for position in range(len(items))
+        }
+        graded = _build_exercise_result(items, answers)
+        if graded["answered"] == 0:
+            st.session_state.pop("exercise_result", None)
+            _set_flash("还没有作答任何题目，请先填写答案再提交。", kind="warning")
+        else:
+            st.session_state["exercise_result"] = graded
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # 应用入口
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -1218,8 +1713,8 @@ def main() -> None:
     st.title("课程资料问答与复习规划助手")
     st.caption("单门课程 · RAG 可追溯问答 · 规则降级复习计划")
 
-    tab_documents, tab_chat, tab_plan = st.tabs(
-        ["资料管理", "课程问答", "复习计划"]
+    tab_documents, tab_chat, tab_plan, tab_exercises = st.tabs(
+        ["资料管理", "课程问答", "复习计划", "练习自测"]
     )
     with tab_documents:
         _render_documents_tab()
@@ -1227,6 +1722,8 @@ def main() -> None:
         _render_chat_tab()
     with tab_plan:
         _render_plan_tab()
+    with tab_exercises:
+        _render_exercises_tab()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import chat, documents, plan
+from app.api import exercises
 from app.api.common import (
     RequestIDMiddleware,
     ensure_data_dirs,
@@ -92,6 +93,7 @@ register_exception_handlers(app)
 app.include_router(documents.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(plan.router, prefix="/api")
+app.include_router(exercises.router, prefix="/api")
 
 
 def _module_available(module_name: str) -> bool:
