@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 环境变量与密钥（切勿提交）
+.env
+
+# 运行时数据
+data/uploads/*
+!data/uploads/.gitkeep
+data/chroma/*
+!data/chroma/.gitkeep
+data/samples/*
+!data/samples/.gitkeep
+data/parsed/*
+data/registry/*
+data/plans/*
+data/cache/*
+data/logs/*
+
+# 本地模型（体积过大，不入库）
+models/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.streamlit/cache/
+.uvcache/
+.tmp/
+pytest-cache-files-*/
+_probe2/
+_smoke_tmp/
+
+# 系统文件
+Thumbs.db
+.DS_Store

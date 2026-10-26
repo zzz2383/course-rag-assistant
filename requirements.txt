@@ -1,0 +1,27 @@
+# Web 框架
+fastapi~=0.115.6
+uvicorn[standard]~=0.32.1
+pydantic~=2.9.2
+pydantic-settings~=2.6.1
+python-multipart~=0.0.19
+
+# LangChain / RAG
+langchain~=0.3.13
+langchain-community~=0.3.13
+langchain-text-splitters~=0.3.4
+
+# 向量库与 Embedding
+chromadb~=0.5.23
+# sentence-transformers~=3.3.1   # 可选：本地 Embedding（EMBEDDING_MODE=local 时需要，会附带安装 torch）
+
+# 文档解析
+pypdf~=5.1.0
+python-pptx~=1.0.2
+python-docx~=1.1.2
+
+# 工具
+requests~=2.32.3
+python-dotenv~=1.0.1
+
+# 前端
+streamlit~=1.41.1

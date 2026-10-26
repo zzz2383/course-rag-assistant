@@ -1,0 +1,22 @@
+# =============================================================================
+# Streamlit 界面配置（中文）
+# =============================================================================
+
+[theme]
+base = "light"
+primaryColor = "#3B6FD4"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#262730"
+font = "sans serif"
+
+[client]
+showErrorDetails = "full"
+toolbarMode = "minimal"
+
+[server]
+headless = true
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
