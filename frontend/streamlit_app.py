@@ -33,6 +33,13 @@ EXERCISE_TYPE_ORDER = ("blank", "choice")
 EXERCISE_DIFFICULTY_LABELS = {"easy": "简单", "medium": "中等", "hard": "困难"}
 EXERCISE_CHOICE_PLACEHOLDER = "（请选择）"
 
+# 课程/章节下拉框使用的固定文案。Streamlit 没有“可选可填”控件，
+# 统一用“已有值 + ＋ 新建…”哨兵项来模拟“既能选已有、也能新增”的交互。
+ALL_CHAPTERS_LABEL = "全部章节"
+NO_CHAPTER_LABEL = "不指定章节"
+NEW_COURSE_LABEL = "＋ 新建课程"
+NEW_CHAPTER_LABEL = "＋ 新建章节"
+
 STATUS_LABELS = {
     "uploaded": "处理中",
     "parsed": "待索引",
@@ -611,6 +618,54 @@ def _sync_documents(*, show_error: bool = True) -> bool:
     return True
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _course_options() -> list[str]:
+    """从已上传文档中提取去重、排序后的课程名称，供下拉框使用。
+
+    课程名的唯一事实来源是后端文档列表：只调用 ``list_documents()``，
+    后端不可达时返回空列表，由各页面给出中文提示。缓存 15 秒避免每次
+    rerun 都请求后端；上传/删除成功后会显式 clear()，保证新课程立刻可见。
+    """
+    try:
+        documents = list_documents()
+    except Exception:  # 后端未启动或返回异常时降级为空列表，不影响页面渲染
+        return []
+
+    courses = {_first_text(document, "course", "course_name") for document in documents}
+    return sorted(name for name in courses if name)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _chapter_options(course: str) -> list[str]:
+    """返回指定课程已有文档的章节列表（去重、排序、排除空值）。
+
+    课程名为空时直接返回空列表，避免把其他课程的章节混进来。
+    """
+    target = (course or "").strip()
+    if not target:
+        return []
+
+    try:
+        documents = list_documents()
+    except Exception:
+        return []
+
+    chapters: set[str] = set()
+    for document in documents:
+        if _first_text(document, "course", "course_name") != target:
+            continue
+        chapter = _first_text(document, "chapter", "section")
+        if chapter:
+            chapters.add(chapter)
+    return sorted(chapters)
+
+
+def _clear_document_caches() -> None:
+    """失效课程/章节下拉缓存：上传、删除与手动刷新之后调用。"""
+    _course_options.clear()
+    _chapter_options.clear()
+
+
 def _render_citations(citations: list[Any]) -> None:
     """展示引用来源：文件名、页码与摘录。"""
     if not citations:
@@ -686,18 +741,50 @@ def _render_documents_tab() -> None:
         f"单次不超过 {MAX_UPLOAD_FILES} 个文件。上传后后端会自动解析并建立索引。"
     )
 
-    with st.form("upload_documents_form", clear_on_submit=False):
-        col_course, col_chapter = st.columns(2)
+    # 课程/章节选择放在 form 外：form 内的控件变更不会触发 rerun，
+    # 选完课程后无法立刻刷新该课程下的章节候选；放到 form 前面即可即时联动，
+    # form 内只保留文件选择与提交按钮。
+    course_options = _course_options()
+    col_course, col_chapter = st.columns(2)
+    selected_course = col_course.selectbox(
+        "课程 *",
+        [*course_options, NEW_COURSE_LABEL],
+        index=None if course_options else 0,
+        placeholder="选择已有课程，或选择「＋ 新建课程」",
+        key="upload_course_select",
+        help="课程名用于给上传的资料打标签，问答与练习自测从中读取候选。",
+    )
+    # 只有显式选择「＋ 新建课程」时才显示输入框，避免多余的空输入框干扰。
+    if selected_course == NEW_COURSE_LABEL:
         course = col_course.text_input(
-            "课程名称 *",
-            placeholder="例如：算法设计与分析（单课程项目可固定填写）",
+            "新课程名称 *",
+            placeholder="例如：算法设计与分析",
             key="upload_course_input",
         )
+    else:
+        course = selected_course or ""
+
+    # 章节候选只来自“已存在课程”下的文档；新建课程名尚无资料，直接手填章节。
+    chapter_candidates = _chapter_options(course) if course in course_options else []
+    chapter_choice = col_chapter.selectbox(
+        "章节（可选）",
+        [NO_CHAPTER_LABEL, *chapter_candidates, NEW_CHAPTER_LABEL],
+        index=0,
+        key="upload_chapter_select",
+        help="选择已有章节可保持命名统一；需要新章节时选「＋ 新建章节」再手填。",
+    )
+    if chapter_choice == NEW_CHAPTER_LABEL:
         chapter = col_chapter.text_input(
-            "章节（可选）",
+            "新章节名称（可选）",
             placeholder="例如：第三章 动态规划",
             key="upload_chapter_input",
         )
+    elif chapter_choice == NO_CHAPTER_LABEL:
+        chapter = ""
+    else:
+        chapter = chapter_choice
+
+    with st.form("upload_documents_form", clear_on_submit=False):
         uploaded_files = st.file_uploader(
             "选择课程资料",
             type=SUPPORTED_FILE_TYPES,
@@ -709,7 +796,7 @@ def _render_documents_tab() -> None:
 
     if submitted:
         if not course.strip():
-            st.warning("请填写课程名称后再上传。")
+            st.warning("请选择已有课程或填写新课程名称后再上传。")
         elif not uploaded_files:
             st.warning("请至少选择一个文件。")
         elif len(uploaded_files) > MAX_UPLOAD_FILES:
@@ -731,6 +818,8 @@ def _render_documents_tab() -> None:
                     else:
                         st.success(f"已提交 {len(uploaded_files)} 个文件。")
                         _render_upload_result(upload_result)
+                        # 新课程/新章节已入库，立刻失效下拉缓存，不必等 15 秒 TTL。
+                        _clear_document_caches()
                         if not _sync_documents(show_error=False):
                             st.warning("上传请求已返回，但文档列表刷新失败，请稍后点击“刷新列表”。")
 
@@ -746,6 +835,8 @@ def _render_documents_tab() -> None:
         st.caption(f"最近刷新：{updated_at}" if updated_at else "正在等待首次加载")
 
     if refresh_clicked:
+        # 手动刷新时同时失效课程/章节下拉缓存，让其他页签的选项也拿到最新数据。
+        _clear_document_caches()
         with st.spinner("正在刷新文档列表..."):
             _sync_documents()
     elif not st.session_state.get("documents_loaded"):
@@ -799,6 +890,8 @@ def _render_documents_tab() -> None:
                 _show_backend_error(exc)
             else:
                 _sync_documents(show_error=False)
+                # 删除可能让某门课程/章节不再存在，同步清缓存，避免下拉框残留旧值。
+                _clear_document_caches()
                 _set_flash(f"已删除文档：{target_name}", kind="success")
                 st.rerun()
 
@@ -810,18 +903,37 @@ def _render_chat_tab() -> None:
     st.subheader("课程问答")
     st.caption("答案由后端检索课程资料后生成；请通过下方引用来源核对原文。")
 
+    # 课程/章节下拉框放在 form 外：章节候选依赖已选课程，需要“选课程 → rerun →
+    # 刷新章节候选”的即时联动；若放进 st.form 内，form 不会因选择变化而 rerun，
+    # 章节列表会停留在上一次提交时的状态。因此 form 内只保留问题与提问按钮。
+    course_options = _course_options()
+    if not course_options:
+        # 这里用 return 而不是 st.stop()：st.stop() 会中断整个脚本，
+        # 连其他页签也渲染不出来；return 只跳过本页签的剩余内容。
+        st.warning("暂无课程，请先在「资料管理」页上传资料并填写课程名称。")
+        return
+
+    col_course, col_chapter = st.columns(2)
+    course = col_course.selectbox(
+        "课程",
+        course_options,
+        index=None,
+        placeholder="请选择课程",
+        key="chat_course_select",
+    )
+    # 未选课程时章节只有“全部章节”，且控件置灰，避免带着空课程去提问。
+    chapter_options = _chapter_options(course) if course else []
+    chapter_label = col_chapter.selectbox(
+        "章节（可选）",
+        [ALL_CHAPTERS_LABEL, *chapter_options],
+        index=0,
+        key="chat_chapter_select",
+        disabled=not course,
+    )
+    # 选“全部章节”时提交空字符串；后端 chapter 为空即表示不按章节过滤。
+    chapter = "" if chapter_label == ALL_CHAPTERS_LABEL else str(chapter_label or "")
+
     with st.form("chat_form", clear_on_submit=False):
-        col_course, col_chapter = st.columns(2)
-        course = col_course.text_input(
-            "课程名称 *",
-            placeholder="与上传资料时填写的课程名称保持一致",
-            key="chat_course_input",
-        )
-        chapter = col_chapter.text_input(
-            "章节（可选）",
-            placeholder="留空表示检索整门课程",
-            key="chat_chapter_input",
-        )
         question = st.text_area(
             "你的问题 *",
             placeholder="例如：动态规划的状态转移方程怎么推导？",
@@ -831,16 +943,18 @@ def _render_chat_tab() -> None:
         asked = st.form_submit_button("提问", type="primary")
 
     if asked:
-        if not course.strip():
-            st.warning("请填写课程名称。")
-        elif not question.strip():
+        course_text = (course or "").strip()
+        question_text = (question or "").strip()
+        if not course_text:
+            st.warning("请先选择课程。")
+        elif not question_text:
             st.warning("请输入问题。")
-        elif len(question) > 2000:
+        elif len(question_text) > 2000:
             st.warning("问题过长，请控制在 2000 字以内。")
         else:
             with st.spinner("正在检索资料并生成回答..."):
                 try:
-                    result = ask_question(question, course, chapter)
+                    result = ask_question(question_text, course_text, chapter)
                 except Exception as exc:
                     # 保留已有会话历史，只提示本次调用失败。
                     _show_backend_error(exc)
@@ -849,11 +963,11 @@ def _render_chat_tab() -> None:
                     if not isinstance(citations, list):
                         citations = []
                     entry = {
-                        "question": question.strip(),
+                        "question": question_text,
                         "answer": str(result.get("answer") or "").strip(),
                         "citations": citations,
-                        "course": course.strip(),
-                        "chapter": chapter.strip(),
+                        "course": course_text,
+                        "chapter": chapter,
                         "grounded": result.get("grounded"),
                         "degraded": bool(result.get("degraded")),
                         "degraded_reason": result.get("degraded_reason"),
@@ -1468,17 +1582,29 @@ def _render_exercises_tab() -> None:
     )
 
     with st.container(border=True):
+        # 下拉选项都来自已上传文档；本页不在 form 内，选择课程会立即 rerun 并刷新章节。
+        course_options = _course_options()
         col_course, col_chapter = st.columns(2)
-        course = col_course.text_input(
-            "课程名称 *",
-            placeholder="与上传资料时填写的课程名称保持一致",
-            key="exercise_course_input",
+        course = col_course.selectbox(
+            "课程",
+            course_options or ["（暂无课程）"],
+            index=None,
+            placeholder="请选择课程",
+            key="exercise_course_select",
+            disabled=not course_options,
         )
-        chapter = col_chapter.text_input(
+        chapter_options = _chapter_options(course) if course and course_options else []
+        chapter_label = col_chapter.selectbox(
             "章节（可选）",
-            placeholder="留空表示从整门课程中抽题",
-            key="exercise_chapter_input",
+            [ALL_CHAPTERS_LABEL, *chapter_options],
+            index=0,
+            key="exercise_chapter_select",
+            disabled=not (course_options and course),
         )
+        # 选“全部章节”时提交空字符串；后端 chapter 为空即表示从整门课程中抽题。
+        chapter = "" if chapter_label == ALL_CHAPTERS_LABEL else str(chapter_label or "")
+        if not course_options:
+            st.warning("暂无课程，请先在「资料管理」页上传资料并填写课程名称。")
 
         col_count, col_difficulty, col_llm = st.columns([2, 1, 1])
         count = col_count.slider(
@@ -1516,13 +1642,15 @@ def _render_exercises_tab() -> None:
             "生成题目",
             key="generate_exercises_btn",
             type="primary",
+            # 没有任何课程时禁用出题，避免把占位文案当成课程名提交给后端。
+            disabled=not course_options or not course,
         )
 
     if generate_clicked:
-        course_text = course.strip()
+        course_text = (course or "").strip()
         types = [value for value in EXERCISE_TYPE_ORDER if value in selected_types]
         if not course_text:
-            st.warning("请填写课程名称。")
+            st.warning("请先选择课程。")
         elif not types:
             st.warning("请至少选择一种题型（填空题或选择题）。")
         else:
