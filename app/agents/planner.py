@@ -289,21 +289,215 @@ def _activity_types(count: int, is_final: bool) -> list[str]:
     return [base[index % len(base)] for index in range(count)]
 
 
-def _rule_titles(chapter_label: str, is_weak: bool, is_final: bool) -> list[str]:
-    """规则模板的任务文案（过长的合并章节名做截断，满足 schema 长度限制）。"""
+# 规则模板的活动池：每个阶段固定 3 个任务位（读 / 练 / 查），每个任务位有多条
+# 变体文案。当天按「阶段内第几天」取变体，保证同一天三条不重复、相邻两天也不同，
+# 避免单章节或长时间的计划出现每天文案完全一样。
+_PHASE_TASK_SLOTS: dict[str, list[tuple[str, list[str]]]] = {
+    "基础巩固": [
+        (
+            "read",
+            [
+                "通读《{label}》，整理核心概念、术语与公式，画出知识框架",
+                "精读《{label}》的典型例题，标出每一步用到的定理或公式",
+                "对照课件逐节核对《{label}》，把看不懂的地方逐个查证",
+                "按目录顺序过一遍《{label}》，标出必考与只需了解的小节",
+                "把《{label}》的公式与定义抄成对照表，注明适用条件",
+            ],
+        ),
+        (
+            "practice",
+            [
+                "完成《{label}》的基础题 2-3 道，确认概念理解无误",
+                "跟做《{label}》的例题，写完整过程再与答案比对",
+                "把《{label}》的公式代入简单算例，验证自己会用",
+                "挑《{label}》中 2 道典型题独立完成，限时 15 分钟",
+                "把《{label}》的概念题与计算题各做 1 道，检查理解深度",
+            ],
+        ),
+        (
+            "review",
+            [
+                "合上资料复述《{label}》的要点，整理 3 条笔记",
+                "把《{label}》的知识点整理成一页框架图",
+                "用 5 分钟自问自答，检查《{label}》哪些概念还说不清",
+                "口头讲一遍《{label}》的核心结论，讲不通的地方回去补",
+                "把当天学的内容默写成提纲，再对照资料补漏",
+            ],
+        ),
+    ],
+    "强化练习": [
+        (
+            "read",
+            [
+                "梳理《{label}》的解题套路，总结每类题的第一步该做什么",
+                "回看《{label}》的例题解法，整理适用公式与前置条件",
+                "对照《{label}》的考点清单，标记已掌握与仍模糊的部分",
+                "把《{label}》的题型分类列出，给每类配一道代表题",
+                "重读《{label}》中出错最多的几节，找出共同的卡点",
+            ],
+        ),
+        (
+            "practice",
+            [
+                "完成《{label}》的典型例题或课后练习 3-5 道，先做后对答案",
+                "限时 20 分钟做一组《{label}》综合小题，检验掌握程度",
+                "挑《{label}》的 2 道大题完整写出过程，对照评分点自查",
+                "做一套《{label}》的专题小卷 8-10 题，记录用时与正确率",
+                "把《{label}》的易错题型集中做 3 道，重点看陷阱在哪",
+            ],
+        ),
+        (
+            "review",
+            [
+                "整理《{label}》的错题，按题型归纳解题步骤",
+                "把《{label}》的易错点抄成清单，逐条对照检查",
+                "用思维导图串起《{label}》的考点，标出相互关联",
+                "把当天错题重做一遍，确认是真会而不是记住了答案",
+                "复述《{label}》的解题模板，并说明每一步的依据",
+            ],
+        ),
+    ],
+    "冲刺复盘": [
+        (
+            "read",
+            [
+                "快速过一遍《{label}》的笔记与标注，找回记忆",
+                "只看《{label}》的目录与标题，回忆每一节的要点",
+                "浏览《{label}》的公式表，确认每个符号的含义",
+            ],
+        ),
+        (
+            "practice",
+            [
+                "限时 30 分钟做一套《{label}》综合题，按考试节奏作答",
+                "重做《{label}》此前做错的题目，确认能独立完成",
+                "挑《{label}》的 3 道高频题限时完成，练答题速度",
+            ],
+        ),
+        (
+            "review",
+            [
+                "把《{label}》的核心公式与结论压缩成一页速查清单",
+                "对照大纲检查《{label}》是否有遗漏考点，补齐盲区",
+                "整理《{label}》的最后 3 条考前提醒",
+            ],
+        ),
+    ],
+}
+
+# 最后两天：倒数第二天整套模拟，最后一天只做轻量复盘
+_FINAL_TASK_POOL: list[tuple[str, str]] = [
+    ("test", "完成一套覆盖《{label}》的限时模拟测试"),
+    ("review", "对照答案订正错题，记录错误原因与正确解法"),
+    ("summary", "回顾薄弱章节与易错公式，整理考前速查清单"),
+]
+_LAST_DAY_TASK_POOL: list[tuple[str, str]] = [
+    ("test", "按考试时长做一套《{label}》模拟测试，严格计时，只求手感"),
+    ("review", "订正这套题的错误，只看错因，不再展开新知识点"),
+    ("summary", "确认考试时间与物品，调整作息，保证考试当天状态"),
+]
+
+
+# 每天的学习重点：与上面各任务位的变体一一对应，让计划表每一行的「学习重点」也不同
+_PHASE_FOCUS: dict[str, list[str]] = {
+    "基础巩固": [
+        "建立《{label}》的知识框架，理清概念之间的层次",
+        "吃透《{label}》的例题解法，能复现每一步推导",
+        "补齐《{label}》的细节盲点，不留似懂非懂的地方",
+        "划定《{label}》的考试范围，分清必考与只需了解",
+        "整理《{label}》的公式与适用条件，避免套错公式",
+    ],
+    "强化练习": [
+        "归纳《{label}》的题型与通用解题套路",
+        "在限时条件下提高《{label}》的做题准确率",
+        "把《{label}》的大题过程写规范，踩准评分点",
+        "通过专题训练暴露《{label}》的薄弱题型",
+        "集中攻坚《{label}》的易错点与陷阱",
+    ],
+    "冲刺复盘": [
+        "快速唤醒《{label}》的记忆，回到熟悉状态",
+        "按考试节奏检验《{label}》的实际掌握程度",
+        "收口《{label}》的考前清单，确保没有遗漏",
+    ],
+}
+
+
+def _phase_offset(index: int, total_days: int) -> tuple[str, int]:
+    """返回当天所处阶段，以及该阶段内已过去的天数（从 0 开始）。"""
+    phase = _phase_for(index, total_days)
+    offset = 0
+    for previous in range(index):
+        if _phase_for(previous, total_days) == phase:
+            offset += 1
+    return phase, offset
+
+
+def _rule_activities(
+    chapter_label: str,
+    *,
+    is_weak: bool,
+    is_final: bool,
+    is_last_day: bool,
+    phase: str,
+    offset: int,
+) -> list[tuple[str, str]]:
+    """规则模板当天的活动列表 ``[(type, title), ...]``。
+
+    同一阶段的第 ``offset`` 天从每个任务位取第 ``offset`` 条变体，因此一天之内
+    三条任务不会重复、相邻两天三条全都不一样；变体用完后从头开始并加「第 N 轮」
+    标记。过长的合并章节名会截断，以满足 schema 的标题长度限制。
+    """
     label = chapter_label if len(chapter_label) <= 80 else chapter_label[:80] + "……"
+
     if is_final:
-        return [
-            f"完成一套覆盖《{label}》的限时模拟测试",
-            "对照答案订正错题，记录错误原因与正确解法",
-            "回顾薄弱章节与易错公式，整理考前速查清单",
-        ]
-    prefix = "重点补强：" if is_weak else ""
-    return [
-        f"{prefix}阅读并梳理《{label}》的核心概念、定义与公式",
-        f"完成《{label}》的典型例题或课后练习 2-3 道",
-        f"合上资料复述《{label}》要点，整理 3 条笔记",
+        pool = _LAST_DAY_TASK_POOL if is_last_day else _FINAL_TASK_POOL
+        return [(kind, template.format(label=label)) for kind, template in pool]
+
+    slots = _PHASE_TASK_SLOTS.get(phase) or _PHASE_TASK_SLOTS["基础巩固"]
+    activities = [
+        (kind, variants[offset % len(variants)].format(label=label))
+        for kind, variants in slots
     ]
+
+    cycle = min(len(variants) for _, variants in slots)
+    round_no = offset // cycle + 1
+    kind, title = activities[0]
+    if round_no > 1:
+        title = f"第 {round_no} 轮：{title}"
+    if is_weak:
+        title = f"重点补强：{title}"
+    activities[0] = (kind, title)
+    return activities
+
+
+def _phase_objective(
+    chapter_label: str,
+    phase: str,
+    offset: int,
+    is_weak: bool,
+) -> tuple[str, str]:
+    """按阶段与阶段内天数给出当天的学习重点与检查点。
+
+    学习重点与当天的任务文案一一对应，计划表里每一行都不同；检查点按阶段统一，
+    用来判断当天是否达标。
+    """
+    label = chapter_label if len(chapter_label) <= 80 else chapter_label[:80] + "……"
+
+    focuses = _PHASE_FOCUS.get(phase) or _PHASE_FOCUS["基础巩固"]
+    focus = focuses[offset % len(focuses)].format(label=label)
+    round_no = offset // len(focuses) + 1
+    if round_no > 1:
+        focus = f"第 {round_no} 轮：{focus}"
+    if is_weak:
+        focus = f"重点补强 · {focus}"
+
+    checkpoints = {
+        "基础巩固": "能用自己的话复述《{label}》的 3 个要点",
+        "强化练习": "独立完成《{label}》的 3 道典型题，并能说明解题思路",
+        "冲刺复盘": "《{label}》错题本上的题目全部能独立做对",
+    }
+    checkpoint = checkpoints.get(phase, checkpoints["基础巩固"]).format(label=label)
+    return focus, checkpoint
 
 
 def _build_rule_day(
@@ -319,34 +513,45 @@ def _build_rule_day(
     chapter_label = "、".join(chapters)
     is_weak = any(_is_weak_chapter(name, weak_points) for name in chapters)
     is_final = index >= total_days - 2
-    titles = _rule_titles(chapter_label, is_weak, is_final)
-    minutes_list = _split_minutes(daily_minutes, len(titles))
-    types = _activity_types(len(titles), is_final)
+    is_last_day = index >= total_days - 1
+    phase, offset = _phase_offset(index, total_days)
+    if is_final:  # 模拟测试的两天统一归到冲刺复盘，避免与阶段标签矛盾
+        phase = "冲刺复盘"
+
+    activities = _rule_activities(
+        chapter_label,
+        is_weak=is_weak,
+        is_final=is_final,
+        is_last_day=is_last_day,
+        phase=phase,
+        offset=offset,
+    )
+    minutes_list = _split_minutes(daily_minutes, len(activities))
 
     if is_final:
-        objective = "完成综合模拟，定位并订正错题，形成考前速查清单"
-        checkpoint = "模拟测试完成并订正全部错题，能说出 3 条考前易错点"
-    elif is_weak:
-        objective = f"补强薄弱章节《{chapter_label}》，能独立解释核心概念并完成典型题"
-        checkpoint = f"不看资料写出《{chapter_label}》的 3 个核心结论"
+        if is_last_day:
+            objective = "调整状态、轻装上阵，只做手感练习，不再开新内容"
+            checkpoint = "按考试时间作息，物品齐全，能说出 3 条最想提醒自己的话"
+        else:
+            objective = "完成综合模拟，定位并订正错题，形成考前速查清单"
+            checkpoint = "模拟测试完成并订正全部错题，能说出 3 条考前易错点"
     else:
-        objective = f"掌握《{chapter_label}》的核心概念与典型题型"
-        checkpoint = f"能用自己的话复述《{chapter_label}》的 3 个要点"
+        objective, checkpoint = _phase_objective(chapter_label, phase, offset, is_weak)
 
     return {
         "date": start_date + timedelta(days=index),
         "day_index": index + 1,
-        "phase": _phase_for(index, total_days),
+        "phase": phase,
         "chapter": chapter_label,
         "objective": objective,
         "minutes": daily_minutes,
         "activities": [
             {
-                "type": types[position],
+                "type": kind,
                 "title": title[:300],
                 "minutes": minutes_list[position],
             }
-            for position, title in enumerate(titles)
+            for position, (kind, title) in enumerate(activities)
         ],
         "resources": [],
         "checkpoint": checkpoint,

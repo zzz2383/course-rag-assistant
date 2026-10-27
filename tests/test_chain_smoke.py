@@ -353,3 +353,39 @@ def test_generate_plan_accepts_llm_json(monkeypatch) -> None:
         assert sum(item["minutes"] for item in task["activities"]) == task["minutes"]
         assert task["minutes"] <= 90
     PlanResponse.model_validate(plan)
+
+
+def test_rule_plan_single_chapter_days_are_distinct() -> None:
+    """单章节、多天的规则计划，每天的「学习重点」与任务文案不能重复。
+
+    历史缺陷：只有 1 个章节时 ``_chapter_sequence`` 把 10 天全压在同一章上，
+    规则模板退化成了复制粘贴，计划表 10 行一模一样。
+    """
+    plan = planner.generate_plan(
+        date.today() + timedelta(days=10),
+        ["第三章 传输层"],
+        [],
+        days=10,
+        start_date=date.today(),
+        daily_minutes=90,
+        course="计算机网络",
+        use_llm=False,
+    )
+
+    assert plan["generated_by"] == "rule"
+    assert len(plan["tasks"]) == 10
+
+    objectives = [task["objective"] for task in plan["tasks"]]
+    assert len(set(objectives)) == len(objectives), "每天的学习重点都应当不同"
+
+    titles = [item["title"] for task in plan["tasks"] for item in task["activities"]]
+    assert len(set(titles)) == len(titles), "每一天的任务文案都应当不同"
+
+    for task in plan["tasks"]:
+        assert sum(item["minutes"] for item in task["activities"]) == task["minutes"]
+        assert len({item["title"] for item in task["activities"]}) == len(task["activities"])
+
+    # 最后两天是模拟测试 / 考前调整，阶段统一为冲刺复盘
+    assert plan["tasks"][-1]["phase"] == "冲刺复盘"
+    assert any("模拟测试" in item["title"] for item in plan["tasks"][-1]["activities"])
+    PlanResponse.model_validate(plan)
