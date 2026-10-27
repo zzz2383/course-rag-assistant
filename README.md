@@ -6,7 +6,7 @@
 
 ## 界面预览
 
-前端为四页签结构：**资料管理 → 课程问答 → 复习计划 → 练习自测**。
+前端为五页签结构：**资料管理 → 课程问答 → 复习计划 → 练习自测 → 课本原文**。
 
 **资料管理**：上传时指定课程与章节，后端解析完成后立即建索引，页面回显页数、分块数与可用状态。
 
@@ -64,6 +64,19 @@
 - 题目同样优先走大模型，失败时降级为规则生成（挖空 + 干扰项）；
 - 作答后一键提交，自动判分并给出标准答案、解析和原文来源（文件名 + 页码）；
 - 每道题都带 `source_file` 与 `page`，可以回到资料原文核对。
+
+### 5. 课本原文
+
+- 以**翻书**方式浏览已入库资料的原文分块，左右对开、3D 翻页动画，支持键盘方向键与页码跳转；
+- 问答与练习题里的引用卡片带「在原文中查看」按钮，点击后在页面下方展开阅读器，
+  自动翻到引用所在页并**高亮对应段落**；
+- 有真实页码的资料（PDF / PPT）按原页码一页对一页，保证引用页码可以直接核对；
+- 无页码的资料（TXT / DOCX）按每页约 360 字切成虚拟书页，否则整份资料只有一页，翻书失去意义。
+
+阅读器是 `st.components.v1.html` 内嵌的 iframe。这样做的原因很实际：Streamlit 每次
+交互都会重跑整个脚本、重建 DOM，无法承载需要持续 JS 状态的翻页动画，所以把渲染与翻页
+完全交给 iframe 内部，Python 只在用户主动跳转时重新生成一次 HTML。代价是 iframe 高度
+必须写死（`components.html` 不会按内容撑高），这一点在代码注释里也有说明。
 
 ## 架构
 
@@ -152,12 +165,12 @@ course-rag-assistant/
 │   ├── rag/                    # 解析、检索、生成、引用
 │   └── services/               # 解析、分块、Embedding 等服务
 ├── frontend/
-│   └── streamlit_app.py        # Streamlit 四页签前端
+│   └── streamlit_app.py        # Streamlit 五页签前端（含翻书式原文阅读器）
 ├── docs/
 │   ├── 需求分析说明书.md
 │   ├── 总体设计文档.md
 │   └── images/                 # README 界面截图
-├── tests/                      # 后端测试（12 个用例）
+├── tests/                      # 后端测试（18 个用例）
 ├── data/                       # 运行数据：上传、解析、Chroma、计划等（Git 忽略）
 ├── .env.example                # 全部环境变量示例
 ├── .gitignore
@@ -307,12 +320,13 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 .\venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 12 个用例，预期输出 `12 passed`：
+当前 18 个用例，预期输出 `18 passed`：
 
 | 文件 | 覆盖内容 |
 | --- | --- |
-| `tests/test_chain_smoke.py` | 问答主链路冒烟：`answer_question` 返回结构、引用来自检索元数据而非模型自由文本、零召回时的拒答、复习计划的 LLM/规则双路径 |
+| `tests/test_chain_smoke.py` | 问答主链路冒烟：`answer_question` 返回结构、引用来自检索元数据而非模型自由文本、零召回时的拒答、复习计划的 LLM/规则双路径、单章节多天计划不重复 |
 | `tests/test_exerciser.py` | 出题器：题型轮转分配、参数校验、LLM 失败时降级为规则出题、来源字段完整性 |
+| `tests/test_document_chunks.py` | 原文分块接口：多页分组与页码排序、`page=0` 无页码场景、文档存在但无分块、文档不存在返回 404、向量库异常时降级不报 500 |
 
 ## 使用流程
 
@@ -323,6 +337,7 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 5. **生成复习计划**：切换到「复习计划」，选择考试日期和章节，填写薄弱点，生成后查看每日安排。
 6. **导出计划**：点击「导出 Markdown」保存复习计划；如果页面提示规则降级，可稍后在模型恢复后重新生成。
 7. **练习自测**：切换到「练习自测」，选择课程（可选章节）、题目数量和难度，生成后作答并提交判分，可对照解析与原文来源复盘。
+8. **回到原文**：在引用卡片上点「在原文中查看」，页面下方会展开翻书式阅读器并定位到该引用所在页；也可直接切到「课本原文」页签，选择资料后自由翻页。
 
 ## API 约定
 
@@ -332,6 +347,7 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 | --- | --- | --- |
 | `POST` | `/api/documents/upload` | 上传文件（`files` 或 `file` 表单字段，另可带 `course`、`chapter`） |
 | `GET` | `/api/documents` | 文档列表，返回 `items` 或直接列表 |
+| `GET` | `/api/documents/{doc_id}/chunks` | 文档全部分块，按页码分组返回 `{pages: [{page, chunks}]}`，供原文阅读器使用 |
 | `DELETE` | `/api/documents/{doc_id}` | 删除文档及索引 |
 | `POST` | `/api/chat` | 请求 `{question, course, chapter?}`，返回 `{answer, citations}` |
 | `POST` | `/api/plan` | 请求 `{exam_date, chapters, weak_points}`，返回 `{plan, generated_by}` |

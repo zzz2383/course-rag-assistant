@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import date, datetime, timedelta
@@ -16,6 +17,7 @@ from urllib.parse import quote
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # 基础配置
@@ -288,6 +290,25 @@ def delete_document(doc_id: str) -> Any:
         timeout=(5, 60),
     )
     return _unwrap_data(payload)
+
+
+def fetch_document_chunks(doc_id: str) -> dict[str, Any]:
+    """GET /api/documents/{doc_id}/chunks：获取该文档的全部原文分块。
+
+    返回结构由后端约定：``{doc_id, file_name, chunk_count, page_count, pages}``，
+    ``pages`` 为按页码升序的 ``[{"page": int, "chunks": [...]}]``。
+    """
+    payload = _request(
+        "GET",
+        f"/documents/{quote(doc_id, safe='')}/chunks",
+        timeout=(5, 30),
+    )
+    data = _unwrap_data(payload)
+    if not isinstance(data, dict):
+        raise BackendError("后端返回的原文分块格式不正确。")
+    if not isinstance(data.get("pages"), list):
+        data["pages"] = []
+    return data
 
 
 def ask_question(question: str, course: str, chapter: str) -> dict[str, Any]:
@@ -666,8 +687,11 @@ def _clear_document_caches() -> None:
     _chapter_options.clear()
 
 
-def _render_citations(citations: list[Any]) -> None:
-    """展示引用来源：文件名、页码与摘录。"""
+def _render_citations(citations: list[Any], *, entry_number: int = 0) -> None:
+    """展示引用来源：文件名、页码与摘录。
+
+    ``entry_number`` 用于生成唯一的控件 key，并支持「在原文中查看」跳转。
+    """
     if not citations:
         st.caption("本次回答未返回引用来源。")
         return
@@ -682,13 +706,15 @@ def _render_citations(citations: list[Any]) -> None:
             citation, "source_file", "file_name", "filename", "document", "source"
         ) or "未知来源"
         page = citation.get("page")
+        page_number = 0
         if page in (None, ""):
             page_text = "页码未知"
         else:
-            page_number = _display_int(page, default=str(page))
+            page_number = _display_int(page, default=0)
             page_text = "无页码" if page_number == 0 else f"第 {page_number} 页"
         excerpt = _first_text(citation, "excerpt", "snippet", "text", "content")
         locator = _first_text(citation, "locator")
+        doc_id = _first_text(citation, "doc_id")
 
         with st.container(border=True):
             st.markdown(f"**[{index}] {filename}**")
@@ -701,6 +727,19 @@ def _render_citations(citations: list[Any]) -> None:
                 st.markdown(quoted)
             else:
                 st.caption("（后端未返回摘录）")
+            if doc_id:
+                if st.button(
+                    "在原文中查看",
+                    key=f"book_open_{entry_number}_{position}",
+                    help="在下方打开原文阅读器，并定位到该引用所在页",
+                ):
+                    st.session_state["book_jump"] = {
+                        "doc_id": doc_id,
+                        "page": page_number,
+                        "chunk_id": _first_text(citation, "chunk_id"),
+                        "file_name": filename,
+                    }
+                    st.rerun()
 
 
 def _render_chat_entry(entry: dict[str, Any], number: int) -> None:
@@ -726,7 +765,7 @@ def _render_chat_entry(entry: dict[str, Any], number: int) -> None:
             reason = entry.get("degraded_reason")
             st.info(f"本次回答使用了降级模式{f'（{reason}）' if reason else ''}。")
 
-        _render_citations(entry.get("citations") or [])
+        _render_citations(entry.get("citations") or [], entry_number=number)
 
 
 # ---------------------------------------------------------------------------
@@ -997,11 +1036,13 @@ def _render_chat_tab() -> None:
 
     if not history:
         st.info("还没有问答记录。填写上方表单后，答案与引用来源会展示在这里。")
-        return
+    else:
+        st.caption("按最近提问优先展示；刷新页面后会话仍保留在当前浏览器会话中。")
+        for number, entry in reversed(list(enumerate(history, start=1))):
+            _render_chat_entry(entry, number)
 
-    st.caption("按最近提问优先展示；刷新页面后会话仍保留在当前浏览器会话中。")
-    for number, entry in reversed(list(enumerate(history, start=1))):
-        _render_chat_entry(entry, number)
+    # 引用卡片上的「在原文中查看」会写入 book_jump，这里把阅读器展开在页面下方
+    _render_book_jump_panel()
 
 
 # ---------------------------------------------------------------------------
@@ -1811,6 +1852,478 @@ def _render_exercises_tab() -> None:
 # ---------------------------------------------------------------------------
 # 应用入口
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 课本原文：翻书式阅读器
+# ---------------------------------------------------------------------------
+# Streamlit 的执行模型是“每次交互重跑整个脚本”，原生控件无法承载需要持续
+# JS 状态的翻页动画（换页就会被重建）。因此把阅读器放进 st.components 的
+# iframe 里：翻页完全由 iframe 内部 JS 处理，Python 只在“用户主动跳转”时
+# 重新生成一次 HTML。
+#
+# 两个必须遵守的约束：
+#   1. iframe 高度固定（components.html 不会按内容撑高），所以写死 BOOK_VIEWER_HEIGHT；
+#   2. HTML 字符串必须稳定，否则任何无关交互都会让 iframe 重建、阅读进度归零。
+#      页面数据只依赖接口返回内容，不含时间戳/随机数。
+
+BOOK_VIEWER_HEIGHT = 620
+# 单个段落超过该长度时按句号切分，避免一页只有一大坨文字
+BOOK_PARAGRAPH_LIMIT = 260
+# 无页码文件（txt/docx）按该字数切成虚拟书页。按 13px 字号、书页可视高度
+# 实测：约 350-390 字正好填满一页且不会把底部页码挤出可视区，取 360 兼顾均匀。
+BOOK_PAGE_CHAR_CAPACITY = 360
+
+
+def _book_int(value: Any, default: int = 0) -> int:
+    """把后端可能返回的数字或字符串安全地转成 int（供翻书组件内部比较用）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _paginate_paragraphs(
+    paragraphs: list[dict[str, str]],
+    capacity: int = BOOK_PAGE_CHAR_CAPACITY,
+) -> list[list[dict[str, str]]]:
+    """按字数容量把段落切成若干书页。"""
+    buckets: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    size = 0
+    for paragraph in paragraphs:
+        length = len(paragraph["t"])
+        if current and size + length > capacity:
+            buckets.append(current)
+            current = []
+            size = 0
+        current.append(paragraph)
+        size += length
+    if current:
+        buckets.append(current)
+    return buckets or [[]]
+
+
+def _book_paragraphs(text: str, limit: int = BOOK_PARAGRAPH_LIMIT) -> list[str]:
+    """把分块文本切成适合单页排版的段落列表。"""
+    pieces: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        while len(line) > limit:
+            cut = max(line.rfind(mark, 0, limit) for mark in "。！？；.!?")
+            if cut < limit // 2:
+                cut = limit
+            pieces.append(line[: cut + 1].strip())
+            line = line[cut + 1 :].strip()
+        if line:
+            pieces.append(line)
+    return pieces
+
+
+def _book_payload(doc_id: str, start_page: int, target_chunk: str) -> dict[str, Any]:
+    """把后端分块整理成翻书组件需要的页面数据。
+
+    两种分页策略：
+    - 文档带真实页码（PDF/PPT，``page > 0``）时按原页码一页对一页，保持引用可核对；
+    - 无页码文档（txt/docx，``page == 0``）按字数切成虚拟书页，否则整份资料只有一页，
+      翻书就失去意义。
+
+    起始页优先用 ``target_chunk`` 命中位置（引用跳转最准），否则退回页码比较。
+    """
+    raw = fetch_document_chunks(doc_id)
+    start_page = _book_int(start_page)
+
+    groups: list[tuple[int, list[dict[str, str]]]] = []
+    for group in raw.get("pages") or []:
+        if not isinstance(group, dict):
+            continue
+        paragraphs: list[dict[str, str]] = []
+        for chunk in group.get("chunks") or []:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_id = str(chunk.get("chunk_id") or "")
+            for piece in _book_paragraphs(str(chunk.get("text") or "")):
+                paragraphs.append({"t": piece, "c": chunk_id})
+        groups.append((_book_int(group.get("page")), paragraphs))
+
+    pages: list[dict[str, Any]] = []
+    if any(page_no > 0 for page_no, _ in groups):
+        for page_no, paragraphs in groups:
+            pages.append(
+                {
+                    "page": page_no,
+                    "label": "无页码" if page_no <= 0 else f"第 {page_no} 页",
+                    "paras": paragraphs,
+                }
+            )
+    else:
+        flattened = [para for _, paragraphs in groups for para in paragraphs]
+        for position, bucket in enumerate(_paginate_paragraphs(flattened), start=1):
+            pages.append({"page": 0, "label": f"第 {position} 页", "paras": bucket})
+
+    start_index = 0
+    if target_chunk:
+        # 一个分块可能跨多页，取“命中段落最多”的那一页作为落点，比只看第一处更准
+        best_index, best_count = 0, 0
+        for position, item in enumerate(pages):
+            hits = sum(1 for para in item["paras"] if para["c"] == target_chunk)
+            if hits > best_count:
+                best_index, best_count = position, hits
+        start_index = best_index
+    elif any(item["page"] > 0 for item in pages):
+        # 有真实页码时才按页码定位；虚拟分页的 page 全为 0，不能这样比较
+        for position, item in enumerate(pages):
+            if item["page"] <= start_page:
+                start_index = position
+
+    return {
+        "title": str(raw.get("file_name") or ""),
+        "pages": pages,
+        "start": start_index,
+        "target": target_chunk,
+    }
+
+
+def _book_json(payload: dict[str, Any]) -> str:
+    """序列化为可安全嵌入 <script> 的 JSON。"""
+    # 直接内联 </script> 会提前终止标签，把尖括号转成 JSON 的 \\u 转义即可
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+_BOOK_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: #E8E3D5;
+  color: #3F3D36;
+  font-family: "Songti SC", "SimSun", "Noto Serif SC", Georgia, serif;
+  overflow: hidden;
+}
+#app { height: 100%; display: flex; flex-direction: column; }
+#bar {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 9px 12px;
+  background: #DBD5C3;
+  border-bottom: 1px solid #C9C1A9;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+#bar button {
+  font-size: 12px; padding: 4px 13px; cursor: pointer;
+  border: 1px solid #B4AB93; border-radius: 4px;
+  background: #FAF7EF; color: #4A4738;
+}
+#bar button:hover:not(:disabled) { background: #FFFDF6; }
+#bar button:disabled { opacity: .38; cursor: default; }
+#info { font-size: 12px; color: #6B6553; min-width: 132px; text-align: center; }
+#jump {
+  width: 54px; font-size: 12px; padding: 3px 6px; text-align: center;
+  border: 1px solid #B4AB93; border-radius: 4px;
+  background: #FAF7EF; color: #4A4738;
+}
+#stage {
+  flex: 1; position: relative; width: 100%; max-width: 880px;
+  margin: 0 auto; perspective: 2400px;
+}
+.pane { position: absolute; top: 8px; bottom: 8px; width: 50%; overflow: hidden; background: #FAF7EF; }
+#paneL { left: 0; box-shadow: inset -14px 0 20px -16px rgba(88,78,48,.5); }
+#paneR { left: 50%; box-shadow: inset 14px 0 20px -16px rgba(88,78,48,.5); }
+.sheet {
+  position: absolute; top: 8px; bottom: 8px; left: 50%; width: 50%;
+  transform-origin: left center; transform-style: preserve-3d;
+  transition: transform .72s cubic-bezier(.44,.05,.28,1);
+  opacity: 0; visibility: hidden; z-index: 20;
+}
+.sheet.run { opacity: 1; visibility: visible; }
+.sheet.flipped { transform: rotateY(-180deg); }
+.face {
+  position: absolute; inset: 0; overflow: hidden; background: #FAF7EF;
+  backface-visibility: hidden; -webkit-backface-visibility: hidden;
+}
+.face.front { box-shadow: inset 14px 0 20px -16px rgba(88,78,48,.5); }
+.face.back { transform: rotateY(180deg); box-shadow: inset -14px 0 20px -16px rgba(88,78,48,.5); }
+.pg {
+  position: absolute; inset: 0; overflow: auto;
+  padding: 22px 28px 36px;
+  font-size: 13px; line-height: 1.82; color: #3F3D36;
+}
+.pg .pm {
+  font-size: 10.5px; color: #A79F8A; letter-spacing: .14em;
+  margin: 0 0 14px; text-transform: uppercase;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+}
+.pg p { margin: 0 0 8px; text-align: justify; text-indent: 2em; }
+.pg p.hl {
+  background: #F7E9A6; text-indent: 0; border-radius: 2px;
+  padding: 3px 5px; margin: 0 -5px 8px;
+  box-shadow: 0 0 0 2px #F7E9A6;
+}
+.pg .pno {
+  position: absolute; bottom: 11px; left: 0; right: 0;
+  text-align: center; font-size: 11px; color: #9C9480; text-indent: 0;
+}
+.cover {
+  height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 11px; padding: 0 26px; text-align: center;
+}
+.cover-title { font-size: 16px; line-height: 1.65; color: #3F3D36; }
+.cover-meta { font-size: 11px; color: #A79F8A; letter-spacing: .12em; }
+.cover-hint { font-size: 11px; color: #BDB5A0; margin-top: 4px; }
+.pg::-webkit-scrollbar { width: 8px; }
+.pg::-webkit-scrollbar-thumb { background: #D8D1BC; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <button id="prev">上一页</button>
+    <span id="info"></span>
+    <button id="next">下一页</button>
+    <input id="jump" type="number" min="1" value="1">
+    <button id="go">跳转</button>
+  </div>
+  <div id="stage">
+    <div class="pane" id="paneL"><div class="pg" id="pgL"></div></div>
+    <div class="pane" id="paneR"><div class="pg" id="pgR"></div></div>
+    <div class="sheet" id="sheet">
+      <div class="face front"><div class="pg" id="pgF"></div></div>
+      <div class="face back"><div class="pg" id="pgB"></div></div>
+    </div>
+  </div>
+</div>
+<script id="book-data" type="application/json">__BOOK_DATA__</script>
+<script>
+(function () {
+  var DATA = JSON.parse(document.getElementById('book-data').textContent);
+  var pages = DATA.pages || [];
+  var target = DATA.target || '';
+  var cur = Math.min(Math.max(DATA.start | 0, 0), Math.max(pages.length - 1, 0));
+  var busy = false;
+  var byId = function (id) { return document.getElementById(id); };
+
+  function buildCover(el) {
+    el.innerHTML = '';
+    var box = document.createElement('div');
+    box.className = 'cover';
+    var title = document.createElement('div');
+    title.className = 'cover-title';
+    title.textContent = DATA.title || '';
+    var meta = document.createElement('div');
+    meta.className = 'cover-meta';
+    meta.textContent = '共 ' + pages.length + ' 页';
+    var hint = document.createElement('div');
+    hint.className = 'cover-hint';
+    hint.textContent = '点击「下一页」开始阅读';
+    box.appendChild(title);
+    box.appendChild(meta);
+    box.appendChild(hint);
+    el.appendChild(box);
+  }
+
+  function buildPage(el, index) {
+    el.innerHTML = '';
+    if (index < 0) { buildCover(el); return; }
+    if (index >= pages.length) { return; }
+    var page = pages[index];
+    var head = document.createElement('div');
+    head.className = 'pm';
+    head.textContent = DATA.title || '';
+    el.appendChild(head);
+    var list = page.paras || [];
+    var hit = null;
+    for (var i = 0; i < list.length; i++) {
+      var p = document.createElement('p');
+      p.textContent = list[i].t;
+      if (target && list[i].c === target) { p.className = 'hl'; hit = p; }
+      el.appendChild(p);
+    }
+    var no = document.createElement('div');
+    no.className = 'pno';
+    no.textContent = page.label || '';
+    el.appendChild(no);
+    el.scrollTop = hit ? Math.max(0, hit.offsetTop - 70) : 0;
+  }
+
+  function renderStatic() {
+    buildPage(byId('pgL'), cur - 1);
+    buildPage(byId('pgR'), cur);
+    var total = pages.length;
+    byId('info').textContent = total ? ('第 ' + (cur + 1) + ' / ' + total + ' 页') : '暂无内容';
+    byId('prev').disabled = cur <= 0;
+    byId('next').disabled = cur >= total - 1;
+    byId('jump').max = total;
+    byId('jump').value = cur + 1;
+  }
+
+  function flip(dir) {
+    if (busy) { return; }
+    var next = cur + dir;
+    if (next < 0 || next >= pages.length) { return; }
+    busy = true;
+    var sheet = byId('sheet');
+    var back = dir < 0;
+    if (dir > 0) {
+      buildPage(byId('pgF'), cur);
+      buildPage(byId('pgB'), next);
+    } else {
+      buildPage(byId('pgF'), cur - 1);
+      buildPage(byId('pgB'), next - 1);
+    }
+    sheet.style.transition = 'none';
+    sheet.classList.toggle('flipped', back);
+    sheet.classList.add('run');
+    void sheet.offsetWidth;
+    sheet.style.transition = '';
+    void sheet.offsetWidth;
+    sheet.classList.toggle('flipped', !back);
+    window.setTimeout(function () {
+      cur = next;
+      renderStatic();
+      sheet.classList.remove('run');
+      busy = false;
+    }, 760);
+  }
+
+  byId('prev').onclick = function () { flip(-1); };
+  byId('next').onclick = function () { flip(1); };
+  byId('go').onclick = function () {
+    var value = parseInt(byId('jump').value, 10);
+    if (isNaN(value) || !pages.length) { return; }
+    var index = Math.min(Math.max(value - 1, 0), pages.length - 1);
+    if (index === cur) { return; }
+    cur = index;
+    renderStatic();
+  };
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'ArrowLeft') { flip(-1); }
+    if (event.key === 'ArrowRight') { flip(1); }
+  });
+  renderStatic();
+})();
+</script>
+</body>
+</html>"""
+
+
+def _render_book_viewer(
+    doc_id: str,
+    *,
+    start_page: int = 0,
+    target_chunk: str = "",
+    height: int = BOOK_VIEWER_HEIGHT,
+) -> None:
+    """渲染翻书式原文阅读器。"""
+    try:
+        payload = _book_payload(doc_id, start_page, target_chunk)
+    except (BackendError, BackendUnavailable) as exc:
+        st.warning(f"无法读取原文分块：{exc}")
+        return
+    except BackendAPIError as exc:
+        if exc.status_code == 404:
+            st.warning("该资料已不存在，可能已被删除，请刷新文档列表。")
+        else:
+            st.warning(f"无法读取原文分块：{exc}")
+        return
+
+    if not payload["pages"]:
+        st.info("该资料目前没有可阅读的原文分块。")
+        return
+
+    html = _BOOK_TEMPLATE.replace("__BOOK_DATA__", _book_json(payload))
+    components.html(html, height=height, scrolling=False)
+
+
+def _render_book_jump_panel() -> None:
+    """问答页的「原文定位」面板；没有跳转请求时不占用任何空间。"""
+    jump = st.session_state.get("book_jump")
+    if not jump:
+        return
+
+    doc_id = str(jump.get("doc_id") or "")
+    if not doc_id:
+        st.session_state.pop("book_jump", None)
+        return
+
+    st.divider()
+    col_title, col_close = st.columns([5, 1])
+    with col_title:
+        st.subheader("原文定位")
+        page_no = _display_int(jump.get("page"), default=0)
+        pinpoint = "无页码" if page_no <= 0 else f"第 {page_no} 页"
+        st.caption(f"{jump.get('file_name') or doc_id} ｜ {pinpoint}")
+    with col_close:
+        st.write("")
+        if st.button("收起", key="book_jump_close", use_container_width=True):
+            st.session_state.pop("book_jump", None)
+            st.rerun()
+
+    _render_book_viewer(
+        doc_id,
+        start_page=_display_int(jump.get("page"), default=0),
+        target_chunk=str(jump.get("chunk_id") or ""),
+    )
+
+
+def _render_book_tab() -> None:
+    """课本原文页签：选择资料后以翻书方式浏览。"""
+    st.subheader("课本原文")
+    st.caption(
+        "以翻书方式浏览已入库资料的原文分块，页码与问答引用一致；"
+        "在「课程问答」的引用卡片上可以直接跳到对应页。"
+    )
+
+    try:
+        documents = list_documents()
+    except (BackendError, BackendUnavailable) as exc:
+        st.error(f"读取文档列表失败：{exc}")
+        return
+
+    if not documents:
+        st.info("还没有已入库的资料，请先在「资料管理」上传。")
+        return
+
+    options: dict[str, str] = {}
+    for document in documents:
+        doc_id = str(document.get("doc_id") or "")
+        if not doc_id:
+            continue
+        name = str(document.get("file_name") or doc_id)
+        chunk_count = _display_int(document.get("chunk_count"), default=0)
+        options[doc_id] = f"{name}（{chunk_count} 块）"
+
+    if not options:
+        st.info("暂无可阅读的资料。")
+        return
+
+    doc_ids = list(options)
+    selected = st.selectbox(
+        "选择资料",
+        options=doc_ids,
+        format_func=lambda value: options.get(value, value),
+        key="book_doc_select",
+    )
+
+    # 引用跳转过来时，起始页由会话状态决定；否则从第一页开始
+    jump = st.session_state.get("book_jump") or {}
+    start_page = 0
+    target_chunk = ""
+    if jump.get("doc_id") == selected:
+        start_page = _display_int(jump.get("page"), default=0)
+        target_chunk = str(jump.get("chunk_id") or "")
+
+    _render_book_viewer(selected, start_page=start_page, target_chunk=target_chunk)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="课程资料问答与复习规划助手",
@@ -1882,8 +2395,8 @@ def main() -> None:
     st.title("课程资料问答与复习规划助手")
     st.caption("单门课程 · RAG 可追溯问答 · 规则降级复习计划")
 
-    tab_documents, tab_chat, tab_plan, tab_exercises = st.tabs(
-        ["资料管理", "课程问答", "复习计划", "练习自测"]
+    tab_documents, tab_chat, tab_plan, tab_exercises, tab_book = st.tabs(
+        ["资料管理", "课程问答", "复习计划", "练习自测", "课本原文"]
     )
     with tab_documents:
         _render_documents_tab()
@@ -1893,6 +2406,8 @@ def main() -> None:
         _render_plan_tab()
     with tab_exercises:
         _render_exercises_tab()
+    with tab_book:
+        _render_book_tab()
 
 
 if __name__ == "__main__":
