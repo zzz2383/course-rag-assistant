@@ -21,8 +21,8 @@ data/plans/*
 data/cache/*
 data/logs/*
 
-# 本地模型（体积过大，不入库）
-models/
+# 本地模型（体积过大，不入库）。注意锚定根目录，否则会连 app/models/ 一起忽略
+/models/
 
 # 工具缓存
 .pytest_cache/
