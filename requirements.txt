@@ -24,4 +24,4 @@ requests~=2.32.3
 python-dotenv~=1.0.1
 
 # 前端
-streamlit~=1.41.1
+streamlit>=1.41.1,<2.0

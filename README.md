@@ -1,6 +1,6 @@
 # 课程资料问答与复习规划助手
 
-一个面向**单门课程**的 RAG（检索增强生成）学习助手：把 PDF、PPTX、DOCX、TXT 等课程资料上传到后端，系统自动解析、分块并建立向量索引；学生可以用自然语言提问，并获得带文件名和页码的引用来源；还可以根据考试日期、章节和薄弱点生成逐日复习计划并导出 Markdown。
+一个面向**单门课程**的 RAG（检索增强生成）学习助手：把 PDF、PPTX、DOCX、TXT 等课程资料上传到后端，系统自动解析、分块并建立向量索引；学生可以用自然语言提问，并获得带文件名和页码的引用来源；还可以根据考试日期、章节和薄弱点生成逐日复习计划并导出 Markdown，或者基于资料生成填空题／选择题自测并自动判分。
 
 界面使用 Streamlit，后端使用 FastAPI，二者通过 REST API 通信。
 
@@ -31,11 +31,80 @@
 - 使用 `st.download_button` 将计划导出为 Markdown；
 - 当 `generated_by=rule` 时明确提示规则模板降级，计划仍可正常使用。
 
+### 4. 练习自测
+
+- 按课程（可选章节）生成填空题与选择题，单次 1–10 道，可选难度；
+- 题目同样优先走大模型，失败时降级为规则生成（挖空 + 干扰项）；
+- 作答后一键提交，自动判分并给出标准答案、解析和原文来源（文件名 + 页码）；
+- 每道题都带 `source_file` 与 `page`，可以回到资料原文核对。
+
+## 架构
+
+四层结构，层与层之间只通过 REST 契约通信，业务层是纯函数模块，方便单测和替换。
+
+```mermaid
+flowchart TB
+    subgraph L1["表示层 · Streamlit :8501"]
+        direction LR
+        U1["资料管理"]
+        U2["课程问答"]
+        U3["复习计划"]
+        U4["练习自测"]
+    end
+    subgraph L2["接口层 · FastAPI :8000"]
+        direction LR
+        A1["/api/documents"]
+        A2["/api/chat"]
+        A3["/api/plan"]
+        A4["/api/exercises"]
+    end
+    subgraph L3["业务层 · 纯函数模块"]
+        direction LR
+        B1["解析 / 分块 / 向量化"]
+        B2["检索 + 元数据过滤 + 拒答"]
+        B3["计划生成器"]
+        B4["出题器"]
+    end
+    subgraph L4["数据层"]
+        direction LR
+        C1[("Chroma 向量库")]
+        C2[("data/ 文件系统")]
+        C3["DeepSeek / Qwen API"]
+    end
+    L1 -->|"REST + JSON"| L2
+    L2 --> L3
+    L3 --> L4
+```
+
+一条问答请求的链路：
+
+```mermaid
+sequenceDiagram
+    participant U as 学生
+    participant S as Streamlit
+    participant F as FastAPI
+    participant V as Chroma
+    participant L as DeepSeek
+    U->>S: 输入课程 + 章节 + 问题
+    S->>F: POST /api/chat
+    F->>V: 带 where 过滤的向量检索（top-k=5）
+    V-->>F: 命中片段 + 元数据
+    alt 零召回 或 相似度低于阈值
+        F-->>S: 拒答（citations 为空）
+    else 命中
+        F->>L: 拼接上下文 + 强制引用格式的提示词
+        L-->>F: 答案正文
+        F->>F: 服务端重建并校验 citations
+        F-->>S: answer + citations（文件名 / 页码 / 摘录）
+    end
+    S-->>U: 答案 + 可核验的来源列表
+```
+
 ## 技术栈
 
 | 层次 | 技术 |
 | --- | --- |
-| 前端 | Streamlit 1.41、requests、Python 3.11 |
+| 前端 | Streamlit 1.41+、requests、Python 3.11 |
 | 后端 | FastAPI、Uvicorn、Pydantic v2、pydantic-settings |
 | RAG | LangChain、Chroma 向量库、Embedding（本地或 OpenAI 兼容 API） |
 | 大模型 | DeepSeek Chat（默认）/ 通义千问（备用），OpenAI 兼容协议 |
@@ -49,18 +118,18 @@
 course-rag-assistant/
 ├── app/                        # FastAPI 后端（由后端模块提供）
 │   ├── main.py                 # 应用入口、CORS、健康检查
-│   ├── api/                    # /api/documents、/api/chat、/api/plan 路由
-│   ├── agents/                 # 复习计划智能体与规则降级
+│   ├── api/                    # /api/documents、/api/chat、/api/plan、/api/exercises 路由
+│   ├── agents/                 # 复习计划与练习题生成器，均含规则降级
 │   ├── core/                   # 配置、日志、公共异常
 │   ├── models/                 # Pydantic 数据契约
 │   ├── rag/                    # 解析、检索、生成、引用
 │   └── services/               # 解析、分块、Embedding 等服务
 ├── frontend/
-│   └── streamlit_app.py        # Streamlit 三页签前端
+│   └── streamlit_app.py        # Streamlit 四页签前端
 ├── docs/
 │   ├── 需求分析说明书.md
 │   └── 总体设计文档.md
-├── tests/                      # 后端测试
+├── tests/                      # 后端测试（12 个用例）
 ├── data/                       # 运行数据：上传、解析、Chroma、计划等（Git 忽略）
 ├── .env.example                # 全部环境变量示例
 ├── .gitignore
@@ -202,6 +271,21 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 
 `run_frontend.ps1` 会自动读取 `.env` 中的 `API_BASE_URL`；如果没有配置，则使用 `http://127.0.0.1:8000/api`。
 
+## 运行测试
+
+测试全部离线运行：不访问网络，不调用真实大模型，Embedding 与向量库都用注入的假对象替换，所以**不配置 API Key 也能跑通**。
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q
+```
+
+当前 12 个用例，预期输出 `12 passed`：
+
+| 文件 | 覆盖内容 |
+| --- | --- |
+| `tests/test_chain_smoke.py` | 问答主链路冒烟：`answer_question` 返回结构、引用来自检索元数据而非模型自由文本、零召回时的拒答、复习计划的 LLM/规则双路径 |
+| `tests/test_exerciser.py` | 出题器：题型轮转分配、参数校验、LLM 失败时降级为规则出题、来源字段完整性 |
+
 ## 使用流程
 
 1. **上传资料**：打开「资料管理」，填写课程名称（全程保持一致）和可选章节，选择文件后点击「上传并建立索引」。
@@ -210,6 +294,7 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 4. **核对引用**：答案下方会列出文件名、页码和原文摘录。引用列表为空时，说明资料不足以支撑回答，建议补充相关章节。
 5. **生成复习计划**：切换到「复习计划」，选择考试日期和章节，填写薄弱点，生成后查看每日安排。
 6. **导出计划**：点击「导出 Markdown」保存复习计划；如果页面提示规则降级，可稍后在模型恢复后重新生成。
+7. **练习自测**：切换到「练习自测」，选择课程（可选章节）、题目数量和难度，生成后作答并提交判分，可对照解析与原文来源复盘。
 
 ## API 约定
 
@@ -222,6 +307,7 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 | `DELETE` | `/api/documents/{doc_id}` | 删除文档及索引 |
 | `POST` | `/api/chat` | 请求 `{question, course, chapter?}`，返回 `{answer, citations}` |
 | `POST` | `/api/plan` | 请求 `{exam_date, chapters, weak_points}`，返回 `{plan, generated_by}` |
+| `POST` | `/api/exercises` | 请求 `{course, chapter?, count?, types?, difficulty?, use_llm?}`，返回 `{items, generated_by, warnings}` |
 | `GET` | `/api/health` | 前端侧边栏连接探测 |
 
 问答的 `citations` 至少包含：
@@ -252,6 +338,36 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 }
 ```
 
+练习题的响应示例（`type` 为 `blank` 或 `choice`，每题都带来源）：
+
+```json
+{
+  "course": "计算机网络",
+  "chapter": "第三章",
+  "items": [
+    {
+      "type": "blank",
+      "stem": "TCP 通过 ____ 机制实现可靠传输。",
+      "answer": "确认应答与重传",
+      "hint": "与序号和定时器有关",
+      "source_file": "计算机网络-第3章-传输层.txt",
+      "page": 12
+    },
+    {
+      "type": "choice",
+      "stem": "下列哪一项属于传输层协议？",
+      "options": ["IP", "TCP", "ARP", "ICMP"],
+      "answer_index": 1,
+      "explanation": "TCP 位于传输层；IP、ARP、ICMP 均属于网络层。",
+      "source_file": "计算机网络-第3章-传输层.txt",
+      "page": 3
+    }
+  ],
+  "generated_by": "llm",
+  "warnings": []
+}
+```
+
 ## 降级与容错说明
 
 本项目按「先保证可用，再追求智能」的原则设计，常见的降级路径如下：
@@ -264,6 +380,7 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 | 大模型超时 / 额度耗尽 / 未配置 Key | 问答链路降级为检索片段摘录，仍展示答案和引用；计划降级为规则模板 | 检查 `.env` 中的 `DEEPSEEK_API_KEY`；模型恢复后重新提问或生成计划 |
 | 无有效检索结果 | 返回「资料不足」类回答且 `citations=[]` | 补充对应章节资料，或放宽章节筛选 |
 | 复习计划 `generated_by=rule` | 页面显示黄色降级提示，下载按钮仍可用 | 计划可执行；稍后可重新生成以获得 LLM 优化版本 |
+| 练习题 `generated_by=rule` | 题目由规则引擎挖空/生成干扰项，`warnings` 说明原因 | 题目仍可作答判分；模型恢复后重新生成即可 |
 | Streamlit 侧边栏探测失败 | 红色「后端未连接」以及 API 地址 | 核对 `API_BASE_URL`、端口和防火墙设置 |
 
 前端所有后端调用均有异常兜底，不会因为后端未启动或接口返回 4xx/5xx 而显示 Python 堆栈。
