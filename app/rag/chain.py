@@ -387,6 +387,7 @@ def _citation_from_chunk(chunk: dict[str, Any], index: int) -> dict[str, Any]:
     return {
         "index": index,
         "chunk_id": str(metadata.get("chunk_id") or chunk.get("chunk_id") or ""),
+        "doc_id": str(metadata.get("doc_id") or chunk.get("doc_id") or ""),
         "source_file": _chunk_source_file(chunk),
         "page": _chunk_page(chunk),
         "chapter": _chunk_chapter(chunk),

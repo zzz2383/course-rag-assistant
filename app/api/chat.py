@@ -8,7 +8,15 @@
     {
         "answer": "中文答案，含 [1] 等引用标记",
         "citations": [
-            {"source_file": "第3章.pdf", "page": 12, "excerpt": "原文片段……"}
+            {
+                "index": 1,
+                "source_file": "第3章.pdf",
+                "page": 12,
+                "excerpt": "原文片段……",
+                "doc_id": "doc_5a1c9e7b3d21",
+                "chunk_id": "chk_0007",
+                "locator": "page:12",
+            }
         ]
     }
 
@@ -32,10 +40,12 @@ router = APIRouter(prefix="/chat", tags=["问答"])
 
 
 def _citation_to_dict(raw: Any) -> dict[str, Any] | None:
-    """把 RAG 链返回的引用规范化为前端约定的三个字段。
+    """把 RAG 链返回的引用规范化为前端约定的字段。
 
     兼容 dict、Pydantic 模型与带 ``metadata`` 嵌套的检索片段；缺少文件名
-    或完全无内容的引用会被丢弃，避免前端渲染空卡片。
+    或完全无内容的引用会被丢弃，避免前端渲染空卡片。除 ``source_file``、
+    ``page`` 与 ``excerpt`` 外，同时保留 ``doc_id`` / ``chunk_id`` / ``locator``，
+    供前端引用卡片跳转原文阅读器。
     """
     if raw is None:
         return None
@@ -70,10 +80,23 @@ def _citation_to_dict(raw: Any) -> dict[str, Any] | None:
         or data.get("content")
         or ""
     )
+    # 原文阅读器需要 doc_id 与 chunk_id 才能定位并高亮命中段落；
+    # 两者缺失时前端只展示文本引用，不显示「在原文中查看」入口。
+    doc_id = str(data.get("doc_id") or metadata.get("doc_id") or "").strip()
+    chunk_id = str(data.get("chunk_id") or metadata.get("chunk_id") or "").strip()
+    locator = str(data.get("locator") or metadata.get("locator") or "").strip()
+    try:
+        index = int(data.get("index") or 0)
+    except (TypeError, ValueError):
+        index = 0
     return {
+        "index": index,
         "source_file": source_file,
         "page": page,
         "excerpt": truncate_text(excerpt, 200),
+        "doc_id": doc_id,
+        "chunk_id": chunk_id,
+        "locator": locator,
     }
 
 

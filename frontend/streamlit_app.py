@@ -489,8 +489,9 @@ def _render_sidebar() -> None:
         st.markdown(
             "1. 上传课程资料并等待索引完成\n"
             "2. 在「课程问答」中提问并核对引用\n"
-            "3. 在「复习计划」中生成并导出计划\n"
-            "4. 在「练习自测」中生成题目并提交判分"
+            "3. 点「在原文中查看」翻阅命中原文\n"
+            "4. 在「复习计划」中生成并导出计划\n"
+            "5. 在「练习自测」中生成题目并提交判分"
         )
         st.divider()
         st.caption("前端只通过 REST API 访问后端，不读取任何模型密钥。")
@@ -1902,15 +1903,68 @@ def _paginate_paragraphs(
     return buckets or [[]]
 
 
+_BOOK_HEADING_RE = re.compile(
+    r"^(?:\d+(?:\s*[.．]\s*\d+)*[\s.．、]|第[一二三四五六七八九十百]+[章节]|[（(][一二三四五六七八九十]+[）)])"
+)
+_BOOK_TERMINAL = "。！？；：.!?;:”」"
+_BOOK_STOP_CHARS = "。！？；，、：,;:;!?."
+
+
+def _book_is_heading(line: str, prev_closed: bool) -> bool:
+    """判断一行是否为标题（需要单独成段）。"""
+    if len(line) <= 40 and _BOOK_HEADING_RE.match(line):
+        return True
+    # 不含句读的短行（如“本章导读”“（课程讲义·复习用）”）：只有在上文已收尾时才算标题，
+    # 否则它更可能是被硬换行截断的正文片段。
+    if len(line) <= 24 and not any(ch in line for ch in _BOOK_STOP_CHARS):
+        return prev_closed
+    return False
+
+
 def _book_paragraphs(text: str, limit: int = BOOK_PARAGRAPH_LIMIT) -> list[str]:
-    """把分块文本切成适合单页排版的段落列表。"""
-    pieces: list[str] = []
+    """把分块文本切成适合单页排版的段落列表。
+
+    PDF 抽出的文本是“一行一块”，若直接一行一段，书页上会出现大量以缩进
+    开头、句子被硬换行截断的碎片。这里先按行合并回自然段：
+
+    - 编号行、第 X 章/节、以及不含句读的短行视为标题，单独成段；
+    - 上一行以句末标点结尾则另起一段，否则把下一行接到同一段；
+    - 两侧都是 ASCII 字符时补一个空格，避免英文单词粘连。
+
+    合并后再按 ``limit`` 在句末标点处切开，防止单段过长撑破书页。
+    """
+    blocks: list[str] = []
+    buffer = ""
+    prev_closed = True
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        if _book_is_heading(line, prev_closed):
+            if buffer:
+                blocks.append(buffer)
+                buffer = ""
+            blocks.append(line)
+            prev_closed = True
+            continue
+        if not buffer:
+            buffer = line
+        elif buffer[-1] in _BOOK_TERMINAL:
+            blocks.append(buffer)
+            buffer = line
+        elif buffer[-1].isascii() and line[0].isascii() and not buffer[-1].isspace():
+            buffer = f"{buffer} {line}"
+        else:
+            buffer += line
+        prev_closed = buffer[-1] in _BOOK_TERMINAL
+    if buffer:
+        blocks.append(buffer)
+
+    pieces: list[str] = []
+    for block in blocks:
+        line = block
         while len(line) > limit:
-            cut = max(line.rfind(mark, 0, limit) for mark in "。！？；.!?")
+            cut = max(line.rfind(mark, 0, limit) for mark in "。！？；.!?;")
             if cut < limit // 2:
                 cut = limit
             pieces.append(line[: cut + 1].strip())
@@ -1934,6 +1988,7 @@ def _book_payload(doc_id: str, start_page: int, target_chunk: str) -> dict[str, 
     start_page = _book_int(start_page)
 
     groups: list[tuple[int, list[dict[str, str]]]] = []
+    last_text = ""
     for group in raw.get("pages") or []:
         if not isinstance(group, dict):
             continue
@@ -1943,6 +1998,10 @@ def _book_payload(doc_id: str, start_page: int, target_chunk: str) -> dict[str, 
                 continue
             chunk_id = str(chunk.get("chunk_id") or "")
             for piece in _book_paragraphs(str(chunk.get("text") or "")):
+                # 分块之间带 overlap，相邻块的同一段会重复出现，书页上只保留一次
+                if piece == last_text:
+                    continue
+                last_text = piece
                 paragraphs.append({"t": piece, "c": chunk_id})
         groups.append((_book_int(group.get("page")), paragraphs))
 
@@ -2130,6 +2189,18 @@ body {
     el.appendChild(box);
   }
 
+  function fitPage(el) {
+    // 一页 PDF 对应一页书：内容超出时逐步缩小字号，而不是让页面滚动。
+    var size = 13;
+    el.style.fontSize = size + 'px';
+    var guard = 0;
+    while (el.scrollHeight > el.clientHeight + 2 && size > 9.5 && guard < 24) {
+      size -= 0.5;
+      el.style.fontSize = size + 'px';
+      guard += 1;
+    }
+  }
+
   function buildPage(el, index) {
     el.innerHTML = '';
     if (index < 0) { buildCover(el); return; }
@@ -2151,6 +2222,7 @@ body {
     no.className = 'pno';
     no.textContent = page.label || '';
     el.appendChild(no);
+    fitPage(el);
     el.scrollTop = hit ? Math.max(0, hit.offsetTop - 70) : 0;
   }
 
