@@ -6,6 +6,7 @@
 * :meth:`VectorStore.query`：按 ``course`` / ``chapter`` metadata 过滤后检索。
 * :meth:`VectorStore.delete_document`：按 ``doc_id`` 删除某文档的全部向量。
 * :meth:`VectorStore.list_documents`：聚合向量库中的文档清单。
+* :meth:`VectorStore.get_document_chunks`：读取某文档的全部分块（原文阅读器）。
 
 chromadb 采用懒加载导入，未安装依赖时仅在实际访问向量库时抛出明确错误。
 """
@@ -45,6 +46,21 @@ class RetrievedChunk:
             return int(self.metadata.get("page") or 0)
         except (TypeError, ValueError):
             return 0
+
+
+def _flatten_column(values: Any) -> list[Any]:
+    """把 Chroma ``get`` 返回的列规范成一维列表。
+
+    Chroma 在按 ``where`` 过滤时为 ``[]`` 或 ``[...]`` 的扁平结构，但批量
+    查询等场景下可能返回 ``[[]]`` / ``[[...]]`` 的嵌套结构（外层是批次维度）。
+    这里统一只做一层解包，保证调用方拿到的一维数据与 ``ids`` 对齐。
+    """
+    if not isinstance(values, list) or not values:
+        return []
+    first = values[0]
+    if isinstance(first, list):
+        return list(first or [])
+    return list(values)
 
 
 def _default_embedder(texts: Sequence[str]) -> list[list[float]]:
@@ -367,3 +383,58 @@ class VectorStore:
                 summary["chapter"] = str(metadata["chapter"])
 
         return sorted(summaries.values(), key=lambda item: item["source_file"])
+
+    def get_document_chunks(self, doc_id: str) -> list[dict[str, Any]]:
+        """读取指定文档的全部 Chunk（不做相似度排序）。
+
+        Args:
+            doc_id: 文档 ID。
+
+        Returns:
+            按 Chroma 返回顺序排列的 Chunk 列表，每项含 ``chunk_id``、
+            ``text``、``page``、``chapter`` 与原始 ``metadata``。
+
+        Raises:
+            ValueError: ``doc_id`` 为空。
+            RuntimeError: Chroma 读取失败。
+        """
+        document_id = (doc_id or "").strip()
+        if not document_id:
+            raise ValueError("doc_id 不能为空")
+
+        collection = self._get_collection()
+        where = {"doc_id": {"$eq": document_id}}
+        try:
+            # 注意：Chroma 的 ``include`` 不接受 "ids"（主键始终随结果返回），
+            # 传入会导致 include 校验失败，因此这里只显式声明文档与元数据。
+            data = collection.get(
+                where=where,
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:  # noqa: BLE001 - Chroma 异常类型不统一
+            raise RuntimeError(f"读取文档分块失败（doc_id={document_id}）：{exc}") from exc
+
+        # get 的返回可能是扁平列，也可能是按批次嵌套的列，统一展平后按下标对齐。
+        ids = _flatten_column(data.get("ids"))
+        documents = _flatten_column(data.get("documents"))
+        metadatas = _flatten_column(data.get("metadatas"))
+
+        chunks: list[dict[str, Any]] = []
+        for position, chunk_id in enumerate(ids):
+            text = documents[position] if position < len(documents) else ""
+            raw_metadata = metadatas[position] if position < len(metadatas) else None
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            try:
+                page = max(int(metadata.get("page") or 0), 0)
+            except (TypeError, ValueError):
+                page = 0
+            chunks.append(
+                {
+                    "chunk_id": str(chunk_id),
+                    "text": str(text or ""),
+                    "page": page,
+                    "chapter": str(metadata.get("chapter") or "").strip(),
+                    "metadata": metadata,
+                }
+            )
+        return chunks

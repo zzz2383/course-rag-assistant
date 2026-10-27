@@ -1,10 +1,11 @@
 """课程资料管理接口。
 
-提供三个端点：
+提供四个端点：
 
 - ``POST /api/documents/upload``：multipart 上传，校验扩展名与大小后落盘，
   依次执行“解析 → 分块 → 向量化 → 写入向量库”；
 - ``GET /api/documents``：列出已入库文档，支持按课程过滤与分页；
+- ``GET /api/documents/{doc_id}/chunks``：返回文档全部分块并按页码分组；
 - ``DELETE /api/documents/{doc_id}``：删除文档的向量、原始文件与索引元数据。
 
 上传的原始文件保存在 ``data/uploads/{doc_id}/{原文件名}``，文档级元数据
@@ -564,6 +565,62 @@ async def get_document(doc_id: str) -> dict[str, Any]:
     if metadata is None:
         raise APIError(404, "DOC_NOT_FOUND", f"文档不存在：{document_id}")
     return metadata
+
+
+@router.get("/{doc_id}/chunks", summary="查询文档分块（按页分组）")
+async def get_document_chunks(doc_id: str) -> dict[str, Any]:
+    """返回某个文档的全部分块，按页码分组，供前端做原文阅读器。
+
+    - ``pages`` 按 ``page`` 升序；``page=0`` 表示该文件类型无页码（如 txt），
+      属于正常数据而非错误；
+    - ``page_count`` 为去重后的页数，即 ``pages`` 的长度；
+    - 组内保持 Chroma 返回顺序；
+    - 向量库不可用时降级为空分块（``meta.json`` 存在时仍返回 200），
+      仅在向量库与本地元数据都查不到该文档时返回 404。
+    """
+    document_id = _validate_doc_id(doc_id)
+    metadata = _read_meta(document_id)
+
+    chunks: list[Any] = []
+    try:
+        store = _get_vectorstore()
+        chunks = list(await invoke(store.get_document_chunks, {"doc_id": document_id}) or [])
+    except Exception:
+        logger.warning("读取文档分块失败，降级为空分块 doc_id=%s", document_id, exc_info=True)
+        chunks = []
+
+    if metadata is None and not chunks:
+        raise APIError(404, "DOC_NOT_FOUND", f"文档不存在：{document_id}")
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    fallback_file_name = ""
+    for chunk in chunks:
+        page = _chunk_page(chunk)
+        grouped.setdefault(page, []).append(
+            {
+                "chunk_id": str(
+                    chunk.get("chunk_id") if isinstance(chunk, dict) else getattr(chunk, "chunk_id", "")
+                ),
+                "text": _chunk_text(chunk),
+                "chapter": _chunk_chapter(chunk),
+            }
+        )
+        if not fallback_file_name:
+            chunk_metadata = chunk.get("metadata") if isinstance(chunk, dict) else None
+            if isinstance(chunk_metadata, dict):
+                fallback_file_name = str(chunk_metadata.get("source_file") or "")
+
+    pages = [{"page": page, "chunks": grouped[page]} for page in sorted(grouped)]
+    file_name = str((metadata or {}).get("file_name") or fallback_file_name)
+    chunk_count = sum(len(page["chunks"]) for page in pages)
+
+    return {
+        "doc_id": document_id,
+        "file_name": file_name,
+        "chunk_count": chunk_count,
+        "page_count": len(pages),
+        "pages": pages,
+    }
 
 
 # ---------------------------------------------------------------------------
