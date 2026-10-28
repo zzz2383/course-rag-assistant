@@ -20,11 +20,25 @@
 
 ![课程问答](docs/images/03-qa.png)
 
+**引用跳转**：点引用卡片上的「在原文中查看」，问答页下方就地展开阅读器，自动翻到命中页并以高亮底色标出命中段落。
+
+![引用跳转](docs/images/04-citation-open.png)
+
+**课本原文**：左右对开翻书阅读，有页码的资料按真实页码一页对一页，支持按钮、键盘方向键与页码跳转。
+
+![课本原文](docs/images/05-book.png)
+
+**复习计划与导出**：按考试日期生成逐日任务，薄弱章节前置并标注「重点补强」；结果可一键导出 Markdown。
+
+| 复习计划 | 导出结果 |
+|---|---|
+| ![复习计划](docs/images/06-plan.png) | ![导出结果](docs/images/07-export.png) |
+
 **练习自测**：按章节生成填空题与选择题，每题标注来源文件；提交后即时判分并给出标准答案与解析。
 
 | 题目 | 判分结果 |
 |---|---|
-| ![练习题](docs/images/04-exercise.png) | ![判分](docs/images/05-grading.png) |
+| ![练习题](docs/images/08-exercise.png) | ![判分](docs/images/09-grading.png) |
 
 ## 功能
 
@@ -320,13 +334,14 @@ streamlit run frontend/streamlit_app.py --server.port 8501
 .\venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 18 个用例，预期输出 `18 passed`：
+当前 21 个用例，预期输出 `21 passed`：
 
 | 文件 | 覆盖内容 |
 | --- | --- |
 | `tests/test_chain_smoke.py` | 问答主链路冒烟：`answer_question` 返回结构、引用来自检索元数据而非模型自由文本、零召回时的拒答、复习计划的 LLM/规则双路径、单章节多天计划不重复 |
 | `tests/test_exerciser.py` | 出题器：题型轮转分配、参数校验、LLM 失败时降级为规则出题、来源字段完整性 |
 | `tests/test_document_chunks.py` | 原文分块接口：多页分组与页码排序、`page=0` 无页码场景、文档存在但无分块、文档不存在返回 404、向量库异常时降级不报 500 |
+| `tests/test_chat_citations.py` | 引用契约：保留 `doc_id/chunk_id/locator`（前端据此跳到原文）、嵌套 `metadata` 取值、缺文件名的引用被丢弃 |
 
 ## 使用流程
 
