@@ -2277,6 +2277,32 @@ body {
 .cover-hint { font-size: 11px; color: #BDB5A0; margin-top: 4px; }
 .pg::-webkit-scrollbar { width: 8px; }
 .pg::-webkit-scrollbar-thumb { background: #D8D1BC; border-radius: 4px; }
+
+/* 单页模式：手机上双页并排每页只剩 170px，改成一页一屏 */
+#stage.single { perspective: none; width: calc(100% - 16px); }
+#stage.single::after { display: none; }
+#stage.single .pane { left: 0; width: 100%; box-shadow: 0 3px 16px rgba(96,84,52,.16); }
+#stage.single #paneL { box-shadow: 0 3px 16px rgba(96,84,52,.16); }
+#stage.single #paneR, #stage.single .sheet { display: none; }
+@keyframes turnIn {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: none; }
+}
+.pg.turn { animation: turnIn .26s ease-out; }
+
+@media (max-width: 640px) {
+  #bar { flex-wrap: wrap; gap: 6px; padding: 7px 8px; }
+  #bar button { font-size: 12px; padding: 5px 11px; }
+  /* 页码独占一行放在按钮上方，四个控件才排得下 */
+  #info { order: -1; flex: 1 1 100%; min-width: 0; font-size: 11.5px; }
+  #jump { width: 48px; font-size: 12px; padding: 4px 5px; }
+  .pg { padding: 16px 16px 30px; font-size: 12.5px; line-height: 1.85; }
+  .pg .pm { font-size: 9.5px; letter-spacing: .1em; margin-bottom: 10px; }
+  .pg p { margin-bottom: 7px; }
+  .cover {{ padding: 0 14px; gap: 8px; }}
+  .cover-title {{ font-size: 15px; }}
+  .cover-meta, .cover-hint {{ font-size: 10.5px; }}
+}
 </style>
 </head>
 <body>
@@ -2304,12 +2330,26 @@ body {
   var pages = DATA.pages || [];
   var target = DATA.target || '';
   var total = pages.length;
+  // 手机上双页并排每页只剩 170px，改成单页一屏；桌面仍是整叶翻转
+  var NARROW = 640;
+  var narrow = window.matchMedia('(max-width: ' + NARROW + 'px)').matches;
   // 真实书籍里翻动的是一张纸：正面 N、背面 N+1。摊开后左页 = 2s-1、右页 = 2s，
   // s 是跨页序号，所以每次翻页页码前进 2，而不是平移一页。
   var maxSpread = Math.max(0, Math.floor(total / 2));
   var spread = clampSpread(Math.floor(((DATA.start | 0) + 1) / 2));
+  // 单页模式下 pos 是「当前页序号」：0 = 封面，k = 第 k 页（1 起）
+  var maxPos = total;
+  var pos = clampPos(
+    DATA.target ? (DATA.start | 0) + 1 : (DATA.start | 0) > 0 ? (DATA.start | 0) + 1 : 0
+  );
   var busy = false;
   var byId = function (id) { return document.getElementById(id); };
+
+  function clampPos(value) {
+    if (value < 0) { return 0; }
+    if (value > maxPos) { return maxPos; }
+    return value;
+  }
 
   function clampSpread(value) {
     if (value < 0) { return 0; }
@@ -2377,7 +2417,26 @@ body {
     el.scrollTop = hit ? Math.max(0, hit.offsetTop - 70) : 0;
   }
 
+  function renderNarrow() {
+    var el = byId('pgL');
+    buildPage(el, pos === 0 ? -1 : pos - 1);
+    var text;
+    if (!total) {
+      text = '暂无内容';
+    } else if (pos === 0) {
+      text = '封面 · 共 ' + total + ' 页';
+    } else {
+      text = '第 ' + pos + ' 页 / 共 ' + total + ' 页';
+    }
+    byId('info').textContent = text;
+    byId('prev').disabled = pos <= 0;
+    byId('next').disabled = pos >= maxPos;
+    byId('jump').max = total;
+    byId('jump').value = Math.max(pos, 1);
+  }
+
   function renderStatic() {
+    if (narrow) { renderNarrow(); return; }
     var left = spread * 2 - 1;
     var right = spread * 2;
     buildPage(byId('pgL'), left);
@@ -2399,8 +2458,20 @@ body {
     byId('jump').value = Math.min(Math.max(spread * 2 + 1, 1), Math.max(total, 1));
   }
 
+  function stepPage(dir) {
+    var next = pos + dir;
+    if (next < 0 || next > maxPos) { return; }
+    pos = next;
+    renderStatic();
+    var el = byId('pgL');
+    el.classList.remove('turn');
+    void el.offsetWidth;
+    el.classList.add('turn');
+  }
+
   function flip(dir) {
     if (busy || !total) { return; }
+    if (narrow) { stepPage(dir); return; }
     var next = spread + dir;
     if (next < 0 || next > maxSpread) { return; }
     busy = true;
@@ -2444,6 +2515,11 @@ body {
     if (busy || !total) { return; }
     var value = parseInt(byId('jump').value, 10);
     if (isNaN(value)) { return; }
+    if (narrow) {
+      pos = clampPos(Math.min(Math.max(value, 1), total));
+      renderStatic();
+      return;
+    }
     var index = Math.min(Math.max(value - 1, 0), total - 1);
     // 页码换算成跨页：偶数页落在右页、奇数页落在左页，保证目标页一定在视野内
     var next = clampSpread(Math.floor((index + 1) / 2));
@@ -2455,6 +2531,21 @@ body {
     if (event.key === 'ArrowLeft') { flip(-1); }
     if (event.key === 'ArrowRight') { flip(1); }
   });
+  // 旋转屏幕或改窗口宽度时在双页 / 单页之间切换，并保持当前页不丢
+  window.addEventListener('resize', function () {
+    var nowNarrow = window.matchMedia('(max-width: ' + NARROW + 'px)').matches;
+    if (nowNarrow === narrow) { return; }
+    narrow = nowNarrow;
+    byId('stage').classList.toggle('single', narrow);
+    if (narrow) {
+      pos = clampPos(spread * 2 + 1);
+    } else {
+      spread = clampSpread(Math.floor(pos / 2));
+    }
+    renderStatic();
+  });
+
+  if (narrow) { byId('stage').classList.add('single'); }
   renderStatic();
 })();
 </script>
@@ -2576,7 +2667,8 @@ def main() -> None:
         page_title="课程资料问答与复习规划助手",
         page_icon="📚",
         layout="wide",
-        initial_sidebar_state="expanded",
+        # auto：桌面展开、手机收起，否则小屏一进来就被侧边栏盖住
+        initial_sidebar_state="auto",
     )
     st.markdown(theme.CSS, unsafe_allow_html=True)
     _render_sidebar()

@@ -113,3 +113,24 @@ def test_plan_days_falls_back_to_day_index() -> None:
 
     days = streamlit_app._plan_days([{"day": 2, "tasks": ["复习"]}])
     assert days[0]["label"] == "第2天"
+
+
+def test_css_covers_mobile_breakpoint() -> None:
+    """手机端必须有独立的覆盖规则，否则纸页 40px 内边距会把内容挤成一条。"""
+    assert "@media (max-width: 640px)" in theme.CSS
+    mobile = theme.CSS.split("@media (max-width: 640px)", 1)[1]
+    # 页签横滑、列堆叠、纸页内边距是手机端三个关键点
+    assert '[data-testid="stTabs"]' in mobile
+    assert '[data-testid="stHorizontalBlock"]' in mobile
+    assert "stAppViewBlockContainer" in mobile
+
+
+def test_book_viewer_degrades_to_single_page_on_narrow() -> None:
+    """窄屏下书页要退化成单页，而不是把双页压成两条缝。"""
+    import streamlit_app
+
+    html = streamlit_app._BOOK_TEMPLATE
+    assert "#stage.single" in html          # 单页模式的样式
+    assert "function renderNarrow" in html  # 单页渲染分支
+    assert "function stepPage" in html      # 单页逐页翻
+    assert "max-width: " in html and "640px" in html  # 断点判定

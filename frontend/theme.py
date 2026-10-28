@@ -696,6 +696,88 @@ section[data-testid="stSidebar"] .stButton > button:hover {{
   font-family: {FONT_HEAD}; font-size: 13px; letter-spacing: .16em;
   color: var(--ink-faint);
 }}
+
+/* ========== 移动端（≤ 640px） ========== */
+/* 手机上没有足够的横向空间留给双层留白：纸页内边距减半、页签改成可横滑的书口、
+   表单列改为整行堆叠，字号整体下调一档但保留 serif 气质。 */
+@media (max-width: 640px) {{
+  [data-testid="stAppViewBlockContainer"],
+  .block-container {{
+    /* 手机上 Streamlit 顶栏（汉堡菜单）是浮层，留白不够会把报头标题压到它下面 */
+    padding: 3.4rem .7rem 2rem !important;
+    max-width: 100% !important;
+  }}
+
+  /* 报头：字号收紧，副标题不再占两行 */
+  .book-masthead {{ margin: 0 0 10px; padding-bottom: 8px; }}
+  .book-masthead .bm-title {{ font-size: 17px; letter-spacing: .08em; line-height: 1.45; }}
+  .book-masthead .bm-sub {{ font-size: 10px; letter-spacing: .1em; margin-top: 4px; }}
+  .book-masthead .bm-rule {{ width: 34px; margin-top: 7px; }}
+
+  /* 页签：单行横滑，标签收窄；滚动条隐藏避免出现一条灰线 */
+  [data-testid="stTabs"] [data-baseweb="tab-list"] {{
+    overflow-x: auto; overflow-y: hidden; flex-wrap: nowrap;
+    padding: 0 2px; gap: 1px; scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }}
+  [data-testid="stTabs"] [data-baseweb="tab-list"]::-webkit-scrollbar {{ display: none; }}
+  [data-testid="stTabs"] button[data-baseweb="tab"] {{
+    flex: 0 0 auto; padding: 7px 6px 6px;
+    font-size: 12px; letter-spacing: 0;
+    border-radius: 4px 4px 0 0;
+  }}
+  [data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {{
+    padding-bottom: 8px;
+  }}
+
+  /* 纸页：内边距减到一半，页眉小字缩短字距 */
+  [data-testid="stTabs"] [role="tabpanel"] {{
+    padding: 16px 14px 22px;
+    border-radius: 0 4px 4px 4px;
+    min-height: 46vh;
+  }}
+  [data-testid="stTabs"] [role="tabpanel"]::before {{
+    font-size: 8.5px; letter-spacing: .18em;
+    padding-bottom: 8px; margin-bottom: 14px;
+  }}
+
+  /* 表单列在窄屏堆叠，否则「课程 / 章节」两个下拉会被压成一条缝 */
+  [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap; gap: .4rem !important; }}
+  [data-testid="stHorizontalBlock"] > [data-testid="column"] {{
+    flex: 1 1 100% !important; width: 100% !important;
+    min-width: 100% !important;
+  }}
+
+  /* 排版细节 */
+  .stMarkdown h3, [data-testid="stHeadingWithActionElements"] h3 {{
+    font-size: 15px !important; margin: .8rem 0 .5rem;
+  }}
+  .stMarkdown h4 {{ font-size: 13.5px !important; }}
+  .q-head {{ gap: 7px; }}
+  .q-head .qh-stem {{ font-size: 13.5px; line-height: 1.9; }}
+  .qh-hint {{ margin-left: 0; }}
+
+  /* 边注式计划：日期列收窄，任务正文不再二次缩进 */
+  .plan-day {{ gap: 10px; padding: 11px 0; }}
+  .plan-day .pd-date {{ flex: 0 0 54px; }}
+  .plan-day .pd-day {{ font-size: 16px; }}
+  .plan-day .pd-body {{ padding-left: 10px; }}
+  .plan-day .pd-task {{ font-size: 13px; line-height: 1.85; }}
+
+  /* 得分条：允许换行，印记不再被挤到屏幕外 */
+  .score-strip {{ gap: 12px 18px; flex-wrap: wrap; padding-bottom: 10px; }}
+  .score-strip .ss-main {{ font-size: 22px; }}
+  .score-strip .ss-stamp {{ margin-left: 0; }}
+
+  .mark {{ padding: 8px 10px 9px; font-size: 12px; }}
+  .footnotes .fn-item {{ font-size: 12px; }}
+  .qa .a p, .qa .a .a-li {{ font-size: 13.5px; line-height: 1.9; }}
+  .qa .a p.a-h {{ font-size: 13px; }}
+
+  /* 侧边栏在小屏是一张抽屉，书脊竖排太长会顶到屏幕外 */
+  .spine-plate .sp-name {{ font-size: 15px; height: 150px; margin: 10px auto 8px; }}
+  .side-note li {{ font-size: 12px; }}
+}}
 </style>
 """
 
