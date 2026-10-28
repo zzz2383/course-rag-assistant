@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,10 @@ from urllib.parse import quote
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+# 允许以「streamlit run frontend/streamlit_app.py」启动时导入同目录的 theme 模块
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import theme  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 基础配置
@@ -461,14 +466,21 @@ def _probe_backend(base_url: str) -> tuple[bool, str]:
 
 
 def _render_sidebar() -> None:
-    """展示 API 地址、连接状态和启动提示。"""
+    """扉页式侧边栏：书脊铭牌、连接状态、使用顺序。"""
     with st.sidebar:
-        st.header("系统状态")
+        st.markdown(
+            theme.spine_plate("课程资料问答助手", "COURSE READER", "讲义"),
+            unsafe_allow_html=True,
+        )
+
         reachable, detail = _probe_backend(API_BASE_URL)
-        if reachable:
-            st.success("后端已连接")
-        else:
-            st.error("后端未连接")
+        st.markdown(
+            theme.status_line(
+                reachable,
+                "后端已连接" if reachable else "后端未连接",
+            ),
+            unsafe_allow_html=True,
+        )
         st.caption(f"API 地址：{API_BASE_URL}")
         st.caption(detail)
 
@@ -485,13 +497,18 @@ def _render_sidebar() -> None:
                 st.caption("或执行：uvicorn app.main:app --reload")
 
         st.divider()
-        st.markdown("**使用顺序**")
         st.markdown(
-            "1. 上传课程资料并等待索引完成\n"
-            "2. 在「课程问答」中提问并核对引用\n"
-            "3. 点「在原文中查看」翻阅命中原文\n"
-            "4. 在「复习计划」中生成并导出计划\n"
-            "5. 在「练习自测」中生成题目并提交判分"
+            theme.side_note(
+                "阅 读 顺 序",
+                [
+                    "上传课程资料，等待索引完成",
+                    "在「课程问答」提问并核对引用",
+                    "点「在原文中查看」翻阅命中原文",
+                    "在「复习计划」生成并导出计划",
+                    "在「练习自测」作答并提交判分",
+                ],
+            ),
+            unsafe_allow_html=True,
         )
         st.divider()
         st.caption("前端只通过 REST API 访问后端，不读取任何模型密钥。")
@@ -512,7 +529,8 @@ def _short_time(value: Any) -> str:
     if not value:
         return "—"
     text = str(value).replace("T", " ")
-    return text[:19]
+    # 表格列宽有限，秒级精度会把单元格挤成两行，保留到分钟即可。
+    return text[:16]
 
 
 def _first_text(mapping: dict[str, Any], *keys: str) -> str:
@@ -689,7 +707,7 @@ def _clear_document_caches() -> None:
 
 
 def _render_citations(citations: list[Any], *, entry_number: int = 0) -> None:
-    """展示引用来源：文件名、页码与摘录。
+    """以脚注形式展示引用来源，并给出「在原文中查看」入口。
 
     ``entry_number`` 用于生成唯一的控件 key，并支持「在原文中查看」跳转。
     """
@@ -697,7 +715,7 @@ def _render_citations(citations: list[Any], *, entry_number: int = 0) -> None:
         st.caption("本次回答未返回引用来源。")
         return
 
-    st.markdown("**参考来源**")
+    items: list[dict[str, Any]] = []
     for position, citation in enumerate(citations, start=1):
         if not isinstance(citation, dict):
             citation = {"excerpt": str(citation)}
@@ -715,58 +733,132 @@ def _render_citations(citations: list[Any], *, entry_number: int = 0) -> None:
             page_text = "无页码" if page_number == 0 else f"第 {page_number} 页"
         excerpt = _first_text(citation, "excerpt", "snippet", "text", "content")
         locator = _first_text(citation, "locator")
-        doc_id = _first_text(citation, "doc_id")
+        # 「page:4」「chunk-2」这类定位串与页码信息重复，脚注里不再单列
+        if re.fullmatch(r"(page|chunk)\s*[:\-_]?\s*\d+", locator, flags=re.IGNORECASE):
+            locator = ""
 
-        with st.container(border=True):
-            st.markdown(f"**[{index}] {filename}**")
-            meta_parts = [page_text]
-            if locator and locator not in page_text:
-                meta_parts.append(locator)
-            st.caption(" ｜ ".join(meta_parts))
-            if excerpt:
-                quoted = "\n".join(f"> {line}" for line in excerpt.splitlines())
-                st.markdown(quoted)
-            else:
-                st.caption("（后端未返回摘录）")
-            if doc_id:
-                if st.button(
-                    "在原文中查看",
-                    key=f"book_open_{entry_number}_{position}",
-                    help="在下方打开原文阅读器，并定位到该引用所在页",
-                ):
-                    st.session_state["book_jump"] = {
-                        "doc_id": doc_id,
-                        "page": page_number,
-                        "chunk_id": _first_text(citation, "chunk_id"),
-                        "file_name": filename,
-                    }
-                    st.rerun()
+        items.append(
+            {
+                "index": index,
+                "source": filename,
+                "page": page_text,
+                "locator": locator,
+                "excerpt": excerpt,
+                "_page_number": page_number,
+                "_doc_id": _first_text(citation, "doc_id"),
+                "_chunk_id": _first_text(citation, "chunk_id"),
+                "_filename": filename,
+            }
+        )
+
+    st.markdown(theme.footnotes(items), unsafe_allow_html=True)
+
+    jumpable = [item for item in items if item["_doc_id"]]
+    if not jumpable:
+        return
+    columns = st.columns(min(len(jumpable), 4), gap="small")
+    for offset, item in enumerate(jumpable):
+        with columns[offset % len(columns)]:
+            if st.button(
+                f"[{item['index']}] 在原文中查看",
+                key=f"book_open_{entry_number}_{offset}",
+                help="打开原文阅读器，并定位到该引用所在页",
+            ):
+                st.session_state["book_jump"] = {
+                    "doc_id": item["_doc_id"],
+                    "page": item["_page_number"],
+                    "chunk_id": item["_chunk_id"],
+                    "file_name": item["_filename"],
+                }
+                st.rerun()
+
+
+def _order_citations(
+    citations: list[Any], answer: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """按正文出现顺序重排引用，并返回「文件名|页码 → 角标序号」映射。
+
+    模型常在同一句后重复标注同一来源，后端返回的 citations 顺序也未必与正文一致。
+    统一以正文首次出现的顺序编号，保证角标与脚注一一对应。
+    """
+    normalized: list[dict[str, Any]] = []
+    for position, citation in enumerate(citations, start=1):
+        if not isinstance(citation, dict):
+            citation = {"excerpt": str(citation)}
+        filename = _first_text(
+            citation, "source_file", "file_name", "filename", "document", "source"
+        ) or "未知来源"
+        page = citation.get("page")
+        page_text = "" if page in (None, "") else str(_display_int(page, default=""))
+        item = dict(citation)
+        item["_name"] = filename
+        item["_page_key"] = page_text
+        item["_key"] = f"{filename}|{page_text}"
+        item["_pos"] = position
+        normalized.append(item)
+
+    ordered: list[dict[str, Any]] = []
+    used: set[int] = set()
+
+    def take(predicate) -> None:
+        for candidate in normalized:
+            if id(candidate) in used:
+                continue
+            if predicate(candidate):
+                ordered.append(candidate)
+                used.add(id(candidate))
+                return
+
+    for key in theme.citation_keys(answer):
+        name, _, page = key.partition("|")
+        take(lambda c: c["_key"] == key)
+        # 页码对不上时退回按文件名匹配，避免角标全部自增
+        take(lambda c, n=name: c["_name"] == n)
+    for candidate in normalized:
+        if id(candidate) not in used:
+            ordered.append(candidate)
+            used.add(id(candidate))
+
+    mapping: dict[str, Any] = {}
+    for index, item in enumerate(ordered, start=1):
+        item["index"] = index
+        mapping.setdefault(item["_key"], index)
+        mapping.setdefault(f'{item["_name"]}|', index)
+    return ordered, mapping
 
 
 def _render_chat_entry(entry: dict[str, Any], number: int) -> None:
-    """渲染一条问答历史。"""
-    with st.container(border=True):
-        st.markdown(f"**问 {number}：{entry.get('question', '')}**")
-        st.markdown(str(entry.get("answer") or "（无回答内容）"))
+    """渲染一条问答历史：问号方印 + 正文段落 + 脚注。"""
+    meta_parts = [str(entry.get("created_at") or "")]
+    if entry.get("course"):
+        meta_parts.append(f"课程：{entry['course']}")
+    if entry.get("chapter"):
+        meta_parts.append(f"章节：{entry['chapter']}")
+    if entry.get("model"):
+        meta_parts.append(f"模型：{entry['model']}")
+    if entry.get("latency_ms") is not None:
+        meta_parts.append(f"耗时：{entry['latency_ms']} ms")
 
-        meta_parts = [str(entry.get("created_at") or "")]
-        if entry.get("course"):
-            meta_parts.append(f"课程：{entry['course']}")
-        if entry.get("chapter"):
-            meta_parts.append(f"章节：{entry['chapter']}")
-        if entry.get("model"):
-            meta_parts.append(f"模型：{entry['model']}")
-        if entry.get("latency_ms") is not None:
-            meta_parts.append(f"耗时：{entry['latency_ms']} ms")
-        st.caption(" ｜ ".join(part for part in meta_parts if part))
+    answer = str(entry.get("answer") or "")
+    citations, cite_map = _order_citations(entry.get("citations") or [], answer)
+    st.markdown(
+        theme.qa_block(
+            str(entry.get("question") or ""),
+            "",
+            " ｜ ".join(part for part in meta_parts if part),
+            answer_html=theme.answer_paragraphs(answer, citation_map=cite_map),
+            number=number,
+        ),
+        unsafe_allow_html=True,
+    )
 
-        if entry.get("grounded") is False:
-            st.warning("后端判断当前资料不足以支撑该答案，建议核对来源或补充资料。")
-        if entry.get("degraded"):
-            reason = entry.get("degraded_reason")
-            st.info(f"本次回答使用了降级模式{f'（{reason}）' if reason else ''}。")
+    if entry.get("grounded") is False:
+        st.warning("后端判断当前资料不足以支撑该答案，建议核对来源或补充资料。")
+    if entry.get("degraded"):
+        reason = entry.get("degraded_reason")
+        st.info(f"本次回答使用了降级模式{f'（{reason}）' if reason else ''}。")
 
-        _render_citations(entry.get("citations") or [], entry_number=number)
+    _render_citations(citations, entry_number=number)
 
 
 # ---------------------------------------------------------------------------
@@ -870,10 +962,6 @@ def _render_documents_tab() -> None:
         refresh_clicked = st.button(
             "刷新列表", key="refresh_documents_btn", use_container_width=True
         )
-    with col_hint:
-        updated_at = st.session_state.get("documents_updated_at")
-        st.caption(f"最近刷新：{updated_at}" if updated_at else "正在等待首次加载")
-
     if refresh_clicked:
         # 手动刷新时同时失效课程/章节下拉缓存，让其他页签的选项也拿到最新数据。
         _clear_document_caches()
@@ -882,6 +970,11 @@ def _render_documents_tab() -> None:
     elif not st.session_state.get("documents_loaded"):
         with st.spinner("正在读取文档列表..."):
             _sync_documents()
+
+    # 文案放在同步之后渲染，否则首屏永远显示「正在等待首次加载」。
+    with col_hint:
+        updated_at = st.session_state.get("documents_updated_at")
+        st.caption(f"最近刷新：{updated_at}" if updated_at else "尚未加载文档列表")
 
     documents = st.session_state.get("documents", [])
     if not documents:
@@ -1097,9 +1190,53 @@ def _iter_task_texts(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _format_tasks(value: Any) -> str:
-    """表格中的任务摘要。"""
-    return "；".join(_iter_task_texts(value))
+WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _plan_days(plan: list[Any]) -> list[dict[str, Any]]:
+    """把后端计划转换为边注式渲染所需的结构（日期大字 + 任务列表）。"""
+    days: list[dict[str, Any]] = []
+    for position, item in enumerate(plan, start=1):
+        if not isinstance(item, dict):
+            days.append(
+                {
+                    "label": f"第{position}天",
+                    "weekday": "",
+                    "tasks": [str(item)],
+                    "focus": "",
+                }
+            )
+            continue
+
+        day_no = item.get("day") or item.get("day_index") or position
+        raw_date = _first_text(item, "date", "day_date")
+        label = ""
+        weekday = ""
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m-%d", "%m/%d"):
+            try:
+                parsed = datetime.strptime(raw_date, fmt)
+            except ValueError:
+                continue
+            label = parsed.strftime("%m-%d")
+            weekday = WEEKDAY_LABELS[parsed.weekday()]
+            break
+        if not label and raw_date:
+            label = raw_date[-5:] if len(raw_date) >= 5 else raw_date
+        if not label:
+            label = f"第{day_no}天"
+
+        tasks = _iter_task_texts(
+            item.get("tasks") or item.get("activities") or item.get("items") or []
+        )
+        days.append(
+            {
+                "label": label,
+                "weekday": weekday,
+                "tasks": tasks,
+                "focus": _first_text(item, "focus", "objective", "goal", "chapter"),
+            }
+        )
+    return days
 
 
 def _extract_plan_payload(raw: Any) -> tuple[list[Any], str, list[str], str]:
@@ -1131,36 +1268,6 @@ def _extract_plan_payload(raw: Any) -> tuple[list[Any], str, list[str], str]:
         warnings = []
 
     return plan, generated_by, warnings, summary
-
-
-def _plan_rows(plan: list[Any]) -> list[dict[str, Any]]:
-    """构造复习计划表格行。"""
-    rows: list[dict[str, Any]] = []
-    for position, item in enumerate(plan, start=1):
-        if not isinstance(item, dict):
-            rows.append(
-                {
-                    "天": position,
-                    "日期": "—",
-                    "学习重点": "—",
-                    "任务": str(item),
-                }
-            )
-            continue
-
-        day = item.get("day") or item.get("day_index") or position
-        day_date = _first_text(item, "date", "day_date")
-        focus = _first_text(item, "focus", "objective", "goal", "chapter")
-        tasks = item.get("tasks") or item.get("activities") or item.get("items") or []
-        rows.append(
-            {
-                "天": day,
-                "日期": day_date or "—",
-                "学习重点": focus or "—",
-                "任务": _format_tasks(tasks) or "—",
-            }
-        )
-    return rows
 
 
 def _generated_by_label(value: str) -> str:
@@ -1246,24 +1353,25 @@ def _render_saved_plan() -> None:
             f"{generated_by or 'rule'}）。大模型暂不可用或输出校验未通过，"
             "计划仍可执行；模型恢复后可重新生成。"
         )
-    elif generated_by:
-        st.success(f"生成方式：{_generated_by_label(generated_by)}")
-    else:
+    elif not generated_by:
         st.caption("后端未返回 generated_by，无法确认生成方式。")
 
-    meta = f"考试日期：{exam_date or '—'}"
+    # 生成方式与日期时间并作一行版记，避免每条元信息各占一条横幅
+    plan_meta = [f"考试日期：{exam_date or '—'}"]
+    if generated_by:
+        plan_meta.append(f"生成方式：{_generated_by_label(generated_by)}")
     if result.get("generated_at"):
-        meta += f" ｜ 生成时间：{result['generated_at']}"
-    st.caption(meta)
+        plan_meta.append(f"生成时间：{result['generated_at']}")
+    st.caption(" ｜ ".join(plan_meta))
 
     if summary:
         st.info(summary)
     for warning in warnings:
         st.warning(f"提示：{warning}")
 
-    rows = _plan_rows(plan)
-    if rows:
-        st.dataframe(rows, hide_index=True, use_container_width=True)
+    days = _plan_days(plan)
+    if days:
+        st.markdown(theme.plan_days(days), unsafe_allow_html=True)
     else:
         st.warning("后端返回的 plan 为空，暂无可展示的每日任务。")
 
@@ -1546,12 +1654,13 @@ def _render_exercise_meta(meta: dict[str, Any]) -> None:
             f"本题由{label}。大模型暂不可用或输出未通过校验，题目仍可正常作答；"
             "模型恢复后可重新生成。"
         )
-    elif normalized:
-        st.success(f"题目来源：{label}")
-    else:
+    elif not normalized:
         st.caption("后端未返回 generated_by，无法确认题目来源。")
 
+    # 来源与课程/题型等并作一行版记
     meta_parts: list[str] = []
+    if normalized:
+        meta_parts.append(f"题目来源：{label}")
     if meta.get("course"):
         meta_parts.append(f"课程：{meta['course']}")
     if meta.get("chapter"):
@@ -1574,43 +1683,47 @@ def _render_exercise_meta(meta: dict[str, Any]) -> None:
 
 
 def _render_exercise_score(result: dict[str, Any]) -> None:
-    """顶部得分概览：得分、正确率与已作答数量。"""
+    """顶部得分条：得分、正确率、已作答与批阅印记。"""
     total = int(result.get("total") or 0)
     score = int(result.get("score") or 0)
     accuracy = float(result.get("accuracy") or 0.0)
     answered = int(result.get("answered") or 0)
 
-    col_score, col_accuracy, col_answered = st.columns(3)
-    with col_score:
-        st.metric("得分", f"{score}/{total}")
-    with col_accuracy:
-        st.metric("正确率", f"{accuracy:.0f}%")
-    with col_answered:
-        st.metric("已作答", f"{answered}/{total}")
+    if answered >= total and total:
+        stamp = "已批阅"
+    elif answered:
+        stamp = "未答完"
+    else:
+        stamp = "待作答"
+    st.markdown(
+        theme.score_strip(score, total, accuracy, answered, stamp),
+        unsafe_allow_html=True,
+    )
     st.caption(
         f"判分时间：{result.get('graded_at') or '—'}；修改答案后请重新提交以更新得分。"
     )
 
 
-def _render_exercise_feedback(detail: dict[str, Any]) -> None:
-    """展示单题判分：对错、标准答案与解析。"""
-    is_correct = bool(detail.get("is_correct"))
+def _render_exercise_feedback(detail: dict[str, Any], *, source: str = "") -> None:
+    """以朱批形式展示单题判分：对错、标准答案与解析。"""
     answered = bool(detail.get("answered"))
-    if is_correct:
-        st.success("✅ 回答正确")
-    elif not answered:
-        st.error("❌ 未作答")
-    else:
-        st.error(f"❌ 回答不正确 ｜ 你的答案：{detail.get('user_answer') or '（空）'}")
+    correct: bool | None = bool(detail.get("is_correct")) if answered else None
+    explanation = str(detail.get("explanation") or "").strip()
+    if not explanation and not answered:
+        explanation = ""
+    elif not explanation:
+        explanation = "本题为填空题，标准答案直接取自资料原文，可对照下方来源核对。"
 
     st.markdown(
-        f"**正确答案：** {_escape_markdown(str(detail.get('correct_answer') or '—'))}"
+        theme.mark_block(
+            correct=correct,
+            correct_answer=str(detail.get("correct_answer") or "—"),
+            explanation=explanation,
+            source=source,
+            user_answer=str(detail.get("user_answer") or ""),
+        ),
+        unsafe_allow_html=True,
     )
-    explanation = str(detail.get("explanation") or "").strip()
-    if explanation:
-        st.markdown(f"**解析：** {_escape_markdown(explanation)}")
-    else:
-        st.caption("本题为填空题，标准答案直接取自资料原文，可对照下方来源核对。")
 
 
 def _render_exercises_tab() -> None:
@@ -1623,7 +1736,7 @@ def _render_exercises_tab() -> None:
         "并给出标准答案、解析与原文来源。"
     )
 
-    with st.container(border=True):
+    with st.container():
         # 下拉选项都来自已上传文档；本页不在 form 内，选择课程会立即 rerun 并刷新章节。
         course_options = _course_options()
         col_course, col_chapter = st.columns(2)
@@ -1773,14 +1886,19 @@ def _render_exercises_tab() -> None:
     for position, item in enumerate(items):
         kind = _exercise_type(item)
         stem = str(item.get("stem") or "").strip() or "（题干为空）"
-        with st.container(border=True):
+        source = _exercise_source_text(item)
+        if position:
+            st.markdown('<div class="q-sep"></div>', unsafe_allow_html=True)
+        with st.container():
             st.markdown(
-                f"**{position + 1}. [{EXERCISE_TYPE_LABELS[kind]}]** "
-                f"{_escape_markdown(stem)}"
+                theme.question_head(
+                    position + 1,
+                    EXERCISE_TYPE_LABELS[kind],
+                    stem,
+                    str(item.get("hint") or "").strip(),
+                ),
+                unsafe_allow_html=True,
             )
-            hint = str(item.get("hint") or "").strip()
-            if hint:
-                st.caption(f"提示：{hint}")
 
             key = _exercise_answer_key(generation_id, position)
             if kind == "choice":
@@ -1805,9 +1923,9 @@ def _render_exercises_tab() -> None:
 
             detail = details[position] if position < len(details) else None
             if isinstance(detail, dict):
-                st.divider()
-                _render_exercise_feedback(detail)
-            st.caption(_exercise_source_text(item))
+                _render_exercise_feedback(detail, source=source)
+            else:
+                st.caption(source)
 
     col_submit, col_reset, col_tip = st.columns([1, 1, 2])
     with col_submit:
@@ -2062,7 +2180,7 @@ _BOOK_TEMPLATE = """<!DOCTYPE html>
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
 body {
-  background: #E8E3D5;
+  background: #EFE9D8;
   color: #3F3D36;
   font-family: "Songti SC", "SimSun", "Noto Serif SC", Georgia, serif;
   overflow: hidden;
@@ -2072,21 +2190,22 @@ body {
   flex: 0 0 auto; position: relative; z-index: 30;
   display: flex; align-items: center; justify-content: center; gap: 10px;
   padding: 9px 12px;
-  background: #DBD5C3;
-  border-bottom: 1px solid #C9C1A9;
+  background: #E9E2CF;
+  border-bottom: 1px solid #D6CCB2;
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 #bar button {
   font-size: 12px; padding: 4px 13px; cursor: pointer;
-  border: 1px solid #B4AB93; border-radius: 4px;
-  background: #FAF7EF; color: #4A4738;
+  border: 1px solid #C0B59A; border-radius: 2px;
+  background: #FAF7EF; color: #5C5648;
+  letter-spacing: .08em; transition: border-color .16s ease, color .16s ease;
 }
-#bar button:hover:not(:disabled) { background: #FFFDF6; }
+#bar button:hover:not(:disabled) { border-color: #A8442A; color: #A8442A; }
 #bar button:disabled { opacity: .38; cursor: default; }
 #info { font-size: 12px; color: #6B6553; min-width: 150px; text-align: center; }
 #jump {
   width: 54px; font-size: 12px; padding: 3px 6px; text-align: center;
-  border: 1px solid #B4AB93; border-radius: 4px;
+  border: 1px solid #C0B59A; border-radius: 2px;
   background: #FAF7EF; color: #4A4738;
 }
 #stage {
@@ -2459,69 +2578,16 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    st.markdown(theme.CSS, unsafe_allow_html=True)
     _render_sidebar()
 
-    # 隐藏右上角的英文工具栏（Deploy / 三个点菜单中的 Settings、About 等），
-    # 使界面保持全中文。菜单仍可通过 Streamlit 官方快捷键访问。
     st.markdown(
-        """
-        <style>
-        /* 隐藏 Deploy 按钮 */
-        [data-testid="stAppDeployButton"] { display: none !important; }
-        /* 隐藏主菜单（Settings / About 等英文项） */
-        #MainMenu { display: none !important; }
-        /* 隐藏页面顶部的工具栏容器 */
-        [data-testid="stToolbar"] { display: none !important; }
-        [data-testid="stDecoration"] { display: none !important; }
-        [data-testid="stStatusWidget"] { display: none !important; }
-
-        /* ---- 文件上传区中文化 ----
-           Streamlit 的上传控件文案写死在前端 JS 里（Drag and drop ... / Browse files /
-           200MB per file 等），无法用参数配置，这里用 CSS 隐藏英文原文，
-           再用伪元素叠加对应中文，保持界面全中文。 */
-        [data-testid="stFileUploaderDropzone"] {
-            position: relative;
-        }
-        /* 隐藏原文案：Drop/浏览文字所在的 span 与按钮文字 */
-        [data-testid="stFileUploaderDropzone"] > div > span,
-        [data-testid="stFileUploaderDropzone"] small,
-        [data-testid="stFileUploaderDropzoneInstructions"] > div > span,
-        [data-testid="stFileUploaderDropzoneInstructions"] small,
-        [data-testid="stFileUploaderDropzone"] button {
-            font-size: 0 !important;
-            color: transparent !important;
-        }
-        /* 叠加中文提示：拖拽上传 */
-        [data-testid="stFileUploaderDropzoneInstructions"]::after {
-            content: "将文件拖拽到此处上传";
-            display: block;
-            font-size: 0.95rem;
-            color: #31333F;
-            margin-top: 2px;
-        }
-        /* 叠加中文提示：文件大小限制 */
-        [data-testid="stFileUploaderDropzoneInstructions"]::before {
-            content: "支持 PDF / PPTX / DOCX / TXT，单个文件不超过 20MB";
-            display: block;
-            font-size: 0.8rem;
-            color: #808495;
-            margin-top: 4px;
-        }
-        /* 叠加中文提示：选择文件按钮 */
-        [data-testid="stFileUploaderDropzone"] button::after {
-            content: "选择文件";
-            font-size: 0.875rem;
-            color: #31333F;
-        }
-        /* 已选文件列表中的删除按钮提示保持可点击区域 */
-        [data-testid="stFileUploaderFileName"] { word-break: break-all; }
-        </style>
-        """,
+        theme.masthead(
+            "课程资料问答与复习规划助手",
+            "单门课程 · RAG 可追溯问答 · 规则降级复习计划",
+        ),
         unsafe_allow_html=True,
     )
-
-    st.title("课程资料问答与复习规划助手")
-    st.caption("单门课程 · RAG 可追溯问答 · 规则降级复习计划")
 
     tab_documents, tab_chat, tab_plan, tab_exercises, tab_book = st.tabs(
         ["资料管理", "课程问答", "复习计划", "练习自测", "课本原文"]

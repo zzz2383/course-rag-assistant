@@ -4,11 +4,12 @@
 
 [theme]
 base = "light"
-primaryColor = "#3B6FD4"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F5F7FA"
-textColor = "#262730"
-font = "sans serif"
+# 书卷风：米白纸色 + 墨色字 + 朱印强调色，与 frontend/theme.py 的色板一致
+primaryColor = "#A8442A"
+backgroundColor = "#FAF7EF"
+secondaryBackgroundColor = "#EFE9D8"
+textColor = "#2C2A24"
+font = "serif"
 
 [client]
 showErrorDetails = "full"
