@@ -2069,7 +2069,7 @@ body {
 }
 #app { height: 100%; display: flex; flex-direction: column; }
 #bar {
-  flex: 0 0 auto;
+  flex: 0 0 auto; position: relative; z-index: 30;
   display: flex; align-items: center; justify-content: center; gap: 10px;
   padding: 9px 12px;
   background: #DBD5C3;
@@ -2083,15 +2083,26 @@ body {
 }
 #bar button:hover:not(:disabled) { background: #FFFDF6; }
 #bar button:disabled { opacity: .38; cursor: default; }
-#info { font-size: 12px; color: #6B6553; min-width: 132px; text-align: center; }
+#info { font-size: 12px; color: #6B6553; min-width: 150px; text-align: center; }
 #jump {
   width: 54px; font-size: 12px; padding: 3px 6px; text-align: center;
   border: 1px solid #B4AB93; border-radius: 4px;
   background: #FAF7EF; color: #4A4738;
 }
 #stage {
-  flex: 1; position: relative; width: 100%; max-width: 880px;
-  margin: 0 auto; perspective: 2400px;
+  flex: 1; position: relative; max-width: 840px;
+  /* 两侧各留 28px 余量：纸张翻起时透视会把它放大 5% 左右，留白避免压到书框外 */
+  width: calc(100% - 56px);
+  margin: 0 auto; perspective: 3000px;
+}
+/* 书脊中缝：让左右两页看起来是一张摊开的纸，而不是两个并排的框 */
+#stage::after {
+  content: ""; position: absolute; top: 8px; bottom: 8px; left: 50%;
+  width: 22px; margin-left: -11px; pointer-events: none; z-index: 6;
+  background: linear-gradient(90deg,
+    rgba(120,108,78,0) 0%, rgba(120,108,78,.10) 38%,
+    rgba(120,108,78,.20) 50%, rgba(120,108,78,.10) 62%,
+    rgba(120,108,78,0) 100%);
 }
 .pane { position: absolute; top: 8px; bottom: 8px; width: 50%; overflow: hidden; background: #FAF7EF; }
 #paneL { left: 0; box-shadow: inset -14px 0 20px -16px rgba(88,78,48,.5); }
@@ -2107,9 +2118,11 @@ body {
 .face {
   position: absolute; inset: 0; overflow: hidden; background: #FAF7EF;
   backface-visibility: hidden; -webkit-backface-visibility: hidden;
+  /* 外投影让翻起的纸有厚度，底下那页看起来是「被压住」而不是被切碎 */
+  box-shadow: 0 4px 22px rgba(96,84,52,.20), 0 1px 3px rgba(96,84,52,.14);
 }
-.face.front { box-shadow: inset 14px 0 20px -16px rgba(88,78,48,.5); }
-.face.back { transform: rotateY(180deg); box-shadow: inset -14px 0 20px -16px rgba(88,78,48,.5); }
+.face.front { box-shadow: inset 14px 0 20px -16px rgba(88,78,48,.5), 0 4px 22px rgba(96,84,52,.20); }
+.face.back { transform: rotateY(180deg); box-shadow: inset -14px 0 20px -16px rgba(88,78,48,.5), 0 4px 22px rgba(96,84,52,.20); }
 .pg {
   position: absolute; inset: 0; overflow: auto;
   padding: 22px 28px 36px;
@@ -2125,6 +2138,11 @@ body {
   background: #F7E9A6; text-indent: 0; border-radius: 2px;
   padding: 3px 5px; margin: 0 -5px 8px;
   box-shadow: 0 0 0 2px #F7E9A6;
+}
+/* 同一个分块可能覆盖整页，只有第一处标成实心黄，其余用淡底表示"同源范围" */
+.pg p.hl-soft {
+  background: rgba(247,233,166,.48); text-indent: 0; border-radius: 2px;
+  padding: 3px 5px; margin: 0 -5px 8px;
 }
 .pg .pno {
   position: absolute; bottom: 11px; left: 0; right: 0;
@@ -2166,9 +2184,19 @@ body {
   var DATA = JSON.parse(document.getElementById('book-data').textContent);
   var pages = DATA.pages || [];
   var target = DATA.target || '';
-  var cur = Math.min(Math.max(DATA.start | 0, 0), Math.max(pages.length - 1, 0));
+  var total = pages.length;
+  // 真实书籍里翻动的是一张纸：正面 N、背面 N+1。摊开后左页 = 2s-1、右页 = 2s，
+  // s 是跨页序号，所以每次翻页页码前进 2，而不是平移一页。
+  var maxSpread = Math.max(0, Math.floor(total / 2));
+  var spread = clampSpread(Math.floor(((DATA.start | 0) + 1) / 2));
   var busy = false;
   var byId = function (id) { return document.getElementById(id); };
+
+  function clampSpread(value) {
+    if (value < 0) { return 0; }
+    if (value > maxSpread) { return maxSpread; }
+    return value;
+  }
 
   function buildCover(el) {
     el.innerHTML = '';
@@ -2215,7 +2243,11 @@ body {
     for (var i = 0; i < list.length; i++) {
       var p = document.createElement('p');
       p.textContent = list[i].t;
-      if (target && list[i].c === target) { p.className = 'hl'; hit = p; }
+      if (target && list[i].c === target) {
+        // 首处实心高亮作为落点，同分块的其余段落用淡底，避免整页糊成一片黄
+        p.className = hit ? 'hl-soft' : 'hl';
+        if (!hit) { hit = p; }
+      }
       el.appendChild(p);
     }
     var no = document.createElement('div');
@@ -2227,39 +2259,60 @@ body {
   }
 
   function renderStatic() {
-    buildPage(byId('pgL'), cur - 1);
-    buildPage(byId('pgR'), cur);
-    var total = pages.length;
-    byId('info').textContent = total ? ('第 ' + (cur + 1) + ' / ' + total + ' 页') : '暂无内容';
-    byId('prev').disabled = cur <= 0;
-    byId('next').disabled = cur >= total - 1;
+    var left = spread * 2 - 1;
+    var right = spread * 2;
+    buildPage(byId('pgL'), left);
+    buildPage(byId('pgR'), right);
+    var text;
+    if (!total) {
+      text = '暂无内容';
+    } else if (left < 0) {
+      text = '第 1 页 / 共 ' + total + ' 页';
+    } else if (right >= total) {
+      text = '第 ' + (left + 1) + ' 页 / 共 ' + total + ' 页';
+    } else {
+      text = '第 ' + (left + 1) + '–' + (right + 1) + ' 页 / 共 ' + total + ' 页';
+    }
+    byId('info').textContent = text;
+    byId('prev').disabled = spread <= 0;
+    byId('next').disabled = spread >= maxSpread;
     byId('jump').max = total;
-    byId('jump').value = cur + 1;
+    byId('jump').value = Math.min(Math.max(spread * 2 + 1, 1), Math.max(total, 1));
   }
 
   function flip(dir) {
-    if (busy) { return; }
-    var next = cur + dir;
-    if (next < 0 || next >= pages.length) { return; }
+    if (busy || !total) { return; }
+    var next = spread + dir;
+    if (next < 0 || next > maxSpread) { return; }
     busy = true;
+    var forward = dir > 0;
     var sheet = byId('sheet');
-    var back = dir < 0;
-    if (dir > 0) {
-      buildPage(byId('pgF'), cur);
-      buildPage(byId('pgB'), next);
+
+    if (forward) {
+      // 翻的是当前右页这张纸：正面 2s、背面 2s+1（翻过去正好落到新左页）。
+      // 右边底层提前铺上新右页 2s+2，纸一转开露出的就是它。
+      buildPage(byId('pgF'), spread * 2);
+      buildPage(byId('pgB'), spread * 2 + 1);
+      buildPage(byId('pgR'), spread * 2 + 2);
     } else {
-      buildPage(byId('pgF'), cur - 1);
-      buildPage(byId('pgB'), next - 1);
+      // 往回翻：这张纸现在躺在左边，背面 2s-1 朝上、正面 2s-2 落回右边。
+      // 左边底层提前铺上新左页 2s-3，纸卷走后露出来的就是它。
+      buildPage(byId('pgB'), spread * 2 - 1);
+      buildPage(byId('pgF'), spread * 2 - 2);
+      buildPage(byId('pgL'), spread * 2 - 3);
     }
+
     sheet.style.transition = 'none';
-    sheet.classList.toggle('flipped', back);
     sheet.classList.add('run');
+    sheet.classList.toggle('flipped', !forward);
     void sheet.offsetWidth;
     sheet.style.transition = '';
     void sheet.offsetWidth;
-    sheet.classList.toggle('flipped', !back);
+    window.requestAnimationFrame(function () {
+      sheet.classList.toggle('flipped', forward);
+    });
     window.setTimeout(function () {
-      cur = next;
+      spread = next;
       renderStatic();
       sheet.classList.remove('run');
       busy = false;
@@ -2269,11 +2322,14 @@ body {
   byId('prev').onclick = function () { flip(-1); };
   byId('next').onclick = function () { flip(1); };
   byId('go').onclick = function () {
+    if (busy || !total) { return; }
     var value = parseInt(byId('jump').value, 10);
-    if (isNaN(value) || !pages.length) { return; }
-    var index = Math.min(Math.max(value - 1, 0), pages.length - 1);
-    if (index === cur) { return; }
-    cur = index;
+    if (isNaN(value)) { return; }
+    var index = Math.min(Math.max(value - 1, 0), total - 1);
+    // 页码换算成跨页：偶数页落在右页、奇数页落在左页，保证目标页一定在视野内
+    var next = clampSpread(Math.floor((index + 1) / 2));
+    if (next === spread) { return; }
+    spread = next;
     renderStatic();
   };
   document.addEventListener('keydown', function (event) {
